@@ -1,17 +1,23 @@
-//
-//  dockspaceApp.swift
-//  dockspace
-//
-//  Created by gokul on 10/06/26.
-//
-
 import SwiftUI
 
 @main
-struct dockspaceApp: App {
+struct DockspaceApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
     var body: some Scene {
-        WindowGroup {
-            ContentView()
+        // Menu bar icon + dropdown
+        MenuBarExtra {
+            MenuBarMenuView()
+                .environmentObject(appDelegate.appState)
+        } label: {
+            CommandSymbolIconView(size: 15, pointSize: 13)
+        }
+        .menuBarExtraStyle(.menu)
+
+        // Settings window
+        Settings {
+            SettingsView()
+                .environmentObject(appDelegate.appState)
         }
     }
 }

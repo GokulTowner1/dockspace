@@ -1,24 +1,9 @@
-//
-//  ContentView.swift
-//  dockspace
-//
-//  Created by gokul on 10/06/26.
-//
-
 import SwiftUI
 
+// ContentView is unused – the main UI is the floating CommandPaletteView
+// launched via the global workspace hotkey (default ⌘⇧P).
 struct ContentView: View {
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
-        }
-        .padding()
+        EmptyView()
     }
-}
-
-#Preview {
-    ContentView()
 }
