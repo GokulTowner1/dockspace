@@ -90,6 +90,7 @@ final class WelcomeWindowManager {
         windowDelegate.onClose = { [weak self] in
             guard let self, !self.didComplete else { return }
             self.markCompleted()
+            self.window?.contentView = nil
             self.window = nil
         }
         panel.delegate = windowDelegate
@@ -116,6 +117,7 @@ final class WelcomeWindowManager {
         }, completionHandler: { [weak self] in
             window.orderOut(nil)
             window.alphaValue = 1
+            window.contentView = nil
             self?.window = nil
         })
     }

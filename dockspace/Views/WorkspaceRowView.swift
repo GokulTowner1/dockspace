@@ -10,9 +10,13 @@ struct WorkspaceRowView: View, Equatable {
     let workspace: Workspace
     let isSelected: Bool
     let onOpen: () -> Void
+    let onRunAutomation: () -> Void
+    let onEditAutomation: () -> Void
     let onOpenWith: (AppType) -> Void
     let onReveal: () -> Void
     let onFavorite: () -> Void
+    let automationStepCount: Int
+    let isAutomationRunning: Bool
 
     @State private var isHovered      = false
     @State private var hoveredAction: String? = nil
@@ -21,7 +25,10 @@ struct WorkspaceRowView: View, Equatable {
     private var showActions: Bool { isHighlighted }
 
     static func == (lhs: WorkspaceRowView, rhs: WorkspaceRowView) -> Bool {
-        lhs.workspace == rhs.workspace && lhs.isSelected == rhs.isSelected
+        lhs.workspace == rhs.workspace
+            && lhs.isSelected == rhs.isSelected
+            && lhs.automationStepCount == rhs.automationStepCount
+            && lhs.isAutomationRunning == rhs.isAutomationRunning
     }
 
     var body: some View {
@@ -68,6 +75,16 @@ struct WorkspaceRowView: View, Equatable {
                         .background(workspace.projectType.color.opacity(0.14))
                         .clipShape(Capsule())
                 }
+
+                if automationStepCount > 0 {
+                    Text("\(automationStepCount) steps")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.green.opacity(0.9))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
+                        .background(.green.opacity(0.13))
+                        .clipShape(Capsule())
+                }
             }
 
             Text(workspace.displayPath)
@@ -83,18 +100,30 @@ struct WorkspaceRowView: View, Equatable {
 
     private var rightSide: some View {
         ZStack(alignment: .trailing) {
-            if workspace.lastOpened != nil {
-                Text(workspace.timeAgoString)
-                    .font(.system(size: 11, weight: .regular))
-                    .foregroundColor(.secondary.opacity(0.45))
+            if workspace.showsRecencyBadge {
+                if isAutomationRunning {
+                    HStack(spacing: 5) {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.55)
+                        Text("Running")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    .foregroundColor(.green.opacity(0.78))
                     .opacity(showActions ? 0 : 1)
+                } else {
+                    Text(workspace.timeAgoString)
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundColor(.secondary.opacity(0.45))
+                        .opacity(showActions ? 0 : 1)
+                }
             }
 
             quickActionBar
                 .opacity(showActions ? 1 : 0)
                 .allowsHitTesting(showActions)
         }
-        .frame(width: 148, alignment: .trailing)
+        .frame(width: 216, alignment: .trailing)
         .animation(RowMotion.actions, value: showActions)
     }
 
@@ -102,6 +131,19 @@ struct WorkspaceRowView: View, Equatable {
 
     private var quickActionBar: some View {
         HStack(spacing: 3) {
+            actionButton(id: "run", icon: "play.fill",
+                         label: "Run Workspace",
+                         color: .green) { onRunAutomation() }
+
+            actionButton(id: "automation", icon: "slider.horizontal.3",
+                         label: "Edit Automation",
+                         color: .orange) { onEditAutomation() }
+
+            Capsule()
+                .fill(Color.primary.opacity(0.10))
+                .frame(width: 1, height: 16)
+                .padding(.horizontal, 1)
+
             actionButton(id: "cursor", icon: "cursorarrow.rays",
                          label: "Open in Cursor",
                          color: Color(red: 0.54, green: 0.36, blue: 0.97)) { onOpenWith(.cursor) }

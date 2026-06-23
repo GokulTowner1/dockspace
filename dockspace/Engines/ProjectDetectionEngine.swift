@@ -26,6 +26,7 @@ final class ProjectDetectionEngine: @unchecked Sendable {
 
     private let lock = NSLock()
     private var cache: [String: CachedEntry] = [:]
+    private let maxCacheEntries = 256
 
     private struct CachedEntry {
         let directoryModificationDate: Date
@@ -57,6 +58,9 @@ final class ProjectDetectionEngine: @unchecked Sendable {
         let result = runDetection(at: path, fileManager: fm)
 
         lock.lock()
+        if cache.count >= maxCacheEntries, let oldest = cache.keys.first {
+            cache.removeValue(forKey: oldest)
+        }
         cache[path] = CachedEntry(directoryModificationDate: modDate, projectType: result.projectType)
         lock.unlock()
 

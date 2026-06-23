@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import Foundation
 import os.log
 
@@ -8,20 +7,19 @@ private let log = Logger(subsystem: "com.dockspace.app", category: "ProjectIconC
 // MARK: - Icon Cache
 
 /// Downloads official technology logos from the Simple Icons CDN, caches them on disk,
-/// and keeps a memory cache for instant UI rendering.
+/// and keeps a bounded memory cache for visible UI rows.
 @MainActor
-final class ProjectIconCache: ObservableObject {
+final class ProjectIconCache {
 
     static let shared = ProjectIconCache()
-
-    @Published private(set) var revision = 0
 
     private var memoryCache: [ProjectType: NSImage] = [:]
     private let session: URLSession
     private var inflight: Set<ProjectType> = []
+    private var pendingHandlers: [ProjectType: [(NSImage?) -> Void]] = [:]
 
     private init() {
-        let config = URLSessionConfiguration.default
+        let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 15
         config.waitsForConnectivity = true
         session = URLSession(configuration: config)
@@ -45,25 +43,34 @@ final class ProjectIconCache: ObservableObject {
     func image(for type: ProjectType) -> NSImage? {
         if type == .unknown { return nil }
         if let cached = memoryCache[type] { return cached }
-        if let disk = loadFromDisk(type) {
-            memoryCache[type] = disk
+        if let disk = loadFromDisk(type, storeInMemory: true) {
             return disk
         }
         return nil
     }
 
-    /// Preloads every supported project-type logo in the background.
-    func preloadAll() {
-        for type in ProjectType.displayOrder where type != .unknown {
-            ensureLoaded(type)
-        }
+    /// Drops decoded images from memory. Disk cache is preserved for fast reload.
+    func trimMemoryCache() {
+        memoryCache.removeAll(keepingCapacity: false)
+        pendingHandlers.removeAll(keepingCapacity: false)
     }
 
     /// Ensures a single icon is loaded (disk → network).
-    func ensureLoaded(_ type: ProjectType) {
-        guard type != .unknown else { return }
-        if memoryCache[type] != nil { return }
-        if loadFromDisk(type) != nil { return }
+    func ensureLoaded(_ type: ProjectType, onUpdate: ((NSImage?) -> Void)? = nil) {
+        guard type != .unknown else {
+            onUpdate?(nil)
+            return
+        }
+
+        if let image = image(for: type) {
+            onUpdate?(image)
+            return
+        }
+
+        if let onUpdate {
+            pendingHandlers[type, default: []].append(onUpdate)
+        }
+
         guard !inflight.contains(type) else { return }
 
         inflight.insert(type)
@@ -75,28 +82,41 @@ final class ProjectIconCache: ObservableObject {
                 let (data, response) = try await session.data(from: url)
                 guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                     log.error("Icon download failed for \(type.rawValue): bad status")
+                    deliver(type, image: nil)
                     return
                 }
                 guard let image = Self.rasterizeIconData(data, size: 128) else {
                     log.error("Icon rasterization failed for \(type.rawValue)")
+                    deliver(type, image: nil)
                     return
                 }
                 saveToDisk(image, type: type)
                 memoryCache[type] = image
-                revision &+= 1
+                deliver(type, image: image)
             } catch {
                 log.error("Icon download failed for \(type.rawValue): \(error.localizedDescription)")
+                deliver(type, image: nil)
             }
+        }
+    }
+
+    private func deliver(_ type: ProjectType, image: NSImage?) {
+        let handlers = pendingHandlers.removeValue(forKey: type) ?? []
+        for handler in handlers {
+            handler(image)
         }
     }
 
     // MARK: - Disk I/O
 
-    private func loadFromDisk(_ type: ProjectType) -> NSImage? {
+    @discardableResult
+    private func loadFromDisk(_ type: ProjectType, storeInMemory: Bool) -> NSImage? {
         let url = cacheFileURL(for: type)
         guard FileManager.default.fileExists(atPath: url.path),
               let image = NSImage(contentsOf: url) else { return nil }
-        memoryCache[type] = image
+        if storeInMemory {
+            memoryCache[type] = image
+        }
         return image
     }
 

@@ -21,11 +21,12 @@ nonisolated private func realHomeDirectory() -> String {
 
 // MARK: - Discovered path entry (ordered, with recency hint)
 
-/// Lightweight intermediate type so we can preserve order and dates from
+/// Lightweight intermediate type so we can preserve order and ranks from
 /// the editor's history before constructing full Workspace objects.
 private struct PathEntry {
     let path: String
-    let lastOpened: Date? // nil = found via directory scan (no recency info)
+    /// Lower = more recently used in the editor. `nil` = directory scan only.
+    let recencyRank: Int?
 }
 
 // MARK: - WorkspaceDiscoveryEngine
@@ -40,42 +41,18 @@ actor WorkspaceDiscoveryEngine {
 
     // MARK: - Discover
 
-    /// Returns workspaces sorted by `lastOpened` descending (most recent first),
-    /// then alphabetically for workspaces with no recency data.
+    /// Returns workspaces sorted by editor recency rank, then alphabetically.
     func discover() async -> [Workspace] {
         log.info("Starting workspace discovery")
-        ProjectDetectionEngine.shared.invalidateCache()
 
-        // ── 1. Collect ordered entries from each editor ────────────────────
-        var entryMap = [String: PathEntry]()  // path → best entry (most recent wins)
+        // ── 1. Build a single global rank map (Cursor history is authoritative) ──
+        let rankedPaths = Self.collectGlobalEditorRanks(realHome: realHome)
+        log.info("Editor history yielded \(rankedPaths.count) ranked paths")
 
-        func merge(entries: [PathEntry]) {
-            for entry in entries {
-                if let existing = entryMap[entry.path] {
-                    // Keep whichever date is more recent (or prefer dated over nil)
-                    let better: Date?
-                    switch (existing.lastOpened, entry.lastOpened) {
-                    case (.some(let a), .some(let b)): better = a > b ? a : b
-                    case (.some(let a), .none):        better = a
-                    case (.none, .some(let b)):        better = b
-                    case (.none, .none):               better = nil
-                    }
-                    entryMap[entry.path] = PathEntry(path: entry.path, lastOpened: better)
-                } else {
-                    entryMap[entry.path] = entry
-                }
-            }
+        var entryMap = [String: PathEntry]()
+        for (path, rank) in rankedPaths {
+            entryMap[path] = PathEntry(path: path, recencyRank: rank)
         }
-
-        // Cursor
-        let cursorEntries = readAllEditorEntries(appFolder: "Cursor")
-        log.info("Cursor storage yielded \(cursorEntries.count) entries")
-        merge(entries: cursorEntries)
-
-        // VS Code
-        let vscodeEntries = readAllEditorEntries(appFolder: "Code")
-        log.info("VS Code storage yielded \(vscodeEntries.count) entries")
-        merge(entries: vscodeEntries)
 
         // ── 2. Directory scan (no recency info) ────────────────────────────
         let scanRoots = [
@@ -91,7 +68,7 @@ actor WorkspaceDiscoveryEngine {
             for path in scanDirectory(root, maxDepth: 2) {
                 scannedCount += 1
                 if entryMap[path] == nil {
-                    entryMap[path] = PathEntry(path: path, lastOpened: nil)
+                    entryMap[path] = PathEntry(path: path, recencyRank: nil)
                 }
             }
         }
@@ -115,17 +92,18 @@ actor WorkspaceDiscoveryEngine {
                 path: entry.path,
                 appType: appType,
                 projectType: projectType,
-                lastOpened: entry.lastOpened
+                editorRecencyRank: entry.recencyRank
             ))
         }
 
-        // ── 4. Sort: dated entries most-recent-first, then alphabetical ─────
+        // ── 4. Sort: ranked entries first (lower rank = more recent), then alphabetical
         workspaces.sort { a, b in
-            switch (a.lastOpened, b.lastOpened) {
-            case (.some(let da), .some(let db)): return da > db
+            switch (a.editorRecencyRank, b.editorRecencyRank) {
+            case (.some(let ra), .some(let rb)): return ra < rb
             case (.some, .none):                 return true
             case (.none, .some):                 return false
-            case (.none, .none):                 return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            case (.none, .none):
+                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
             }
         }
 
@@ -133,7 +111,136 @@ actor WorkspaceDiscoveryEngine {
         return workspaces
     }
 
-    // MARK: - All Sources for One Editor
+    // MARK: - Global Editor History Order
+
+    /// Builds one sequential rank map across all editors.
+    /// Cursor `history.recentlyOpenedPathsList` is the primary source — it matches
+    /// the editor's own "Recent projects" list. VS Code history appends unseen paths.
+    nonisolated static func collectGlobalEditorRanks(realHome: String) -> [String: Int] {
+        var ranks = [String: Int]()
+        var nextRank = 0
+
+        func ingestOrderedPaths(_ paths: [String]) {
+            for path in paths {
+                guard ranks[path] == nil else { continue }
+                ranks[path] = nextRank
+                nextRank += 1
+            }
+        }
+
+        // ① Cursor recent history — authoritative order
+        ingestOrderedPaths(readRecentHistoryPaths(realHome: realHome, appFolder: "Cursor"))
+
+        // ② VS Code recent history — append paths not already ranked
+        ingestOrderedPaths(readRecentHistoryPaths(realHome: realHome, appFolder: "Code"))
+
+        // ③ Fallback: storage.json open windows (append only, never override ranks)
+        ingestOrderedPaths(readStorageWindowPaths(realHome: realHome, appFolder: "Cursor"))
+        ingestOrderedPaths(readStorageWindowPaths(realHome: realHome, appFolder: "Code"))
+
+        return ranks
+    }
+
+    /// Latest editor history ranks using the real user home directory.
+    nonisolated static func currentEditorRanks() -> [String: Int] {
+        collectGlobalEditorRanks(realHome: realHomeDirectory())
+    }
+
+    /// Reads only `history.recentlyOpenedPathsList` — the same source Cursor shows in its UI.
+    nonisolated static func readRecentHistoryPaths(realHome: String, appFolder: String) -> [String] {
+        let dbPath = "\(realHome)/Library/Application Support/\(appFolder)/User/globalStorage/state.vscdb"
+        guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
+
+        var db: OpaquePointer?
+        let encoded = dbPath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? dbPath
+        let uri     = "file://\(encoded)?immutable=1"
+        let flags   = SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX
+
+        if sqlite3_open_v2(uri, &db, flags, nil) != SQLITE_OK {
+            guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return [] }
+        }
+        defer { sqlite3_close(db) }
+
+        return parseHistoryPathsFromDB(db, key: "history.recentlyOpenedPathsList")
+    }
+
+    nonisolated static func parseHistoryPathsFromDB(_ db: OpaquePointer?, key: String) -> [String] {
+        guard let db else { return [] }
+        var stmt: OpaquePointer?
+        let query = "SELECT value FROM ItemTable WHERE key = '\(key)'"
+        guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW,
+              let raw = sqlite3_column_text(stmt, 0)
+        else { return [] }
+
+        return parseOrderedPaths(String(cString: raw))
+    }
+
+  nonisolated static func readStorageWindowPaths(realHome: String, appFolder: String) -> [String] {
+        let jsonPath = "\(realHome)/Library/Application Support/\(appFolder)/User/globalStorage/storage.json"
+        guard FileManager.default.fileExists(atPath: jsonPath),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: jsonPath)),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return [] }
+
+        var paths = [String]()
+
+        if let ws = root["windowsState"] as? [String: Any],
+           let last = ws["lastActiveWindow"] as? [String: Any],
+           let active = extractWindowPathStatic(last) {
+            paths.append(active)
+        }
+
+        if let ws = root["windowsState"] as? [String: Any],
+           let opened = ws["openedWindows"] as? [[String: Any]] {
+            for window in opened {
+                if let path = extractWindowPathStatic(window) {
+                    paths.append(path)
+                }
+            }
+        }
+
+        if let bw = root["backupWorkspaces"] as? [String: Any],
+           let folders = bw["folders"] as? [[String: Any]] {
+            for folder in folders {
+                if let uri = folder["folderUri"] as? String,
+                   let path = uriToPathStatic(uri) {
+                    paths.append(path)
+                }
+            }
+        }
+
+        return paths
+    }
+
+    nonisolated static func parseOrderedPaths(_ jsonString: String) -> [String] {
+        guard let data = jsonString.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entries = root["entries"] as? [[String: Any]]
+        else { return [] }
+
+        return entries.compactMap { entry -> String? in
+            guard let uri = entry["folderUri"] as? String else { return nil }
+            return uriToPathStatic(uri)
+        }
+    }
+
+    nonisolated static func extractWindowPathStatic(_ window: [String: Any]) -> String? {
+        if let uri = window["folderUri"] as? String { return uriToPathStatic(uri) }
+        if let uri = window["folder"] as? String    { return uriToPathStatic(uri) }
+        return nil
+    }
+
+    nonisolated static func uriToPathStatic(_ uri: String) -> String? {
+        guard uri.hasPrefix("file://") else { return nil }
+        let raw  = uri.replacingOccurrences(of: "file://", with: "")
+        let path = raw.removingPercentEncoding ?? raw
+        return path.isEmpty ? nil : path
+    }
+
+    // MARK: - All Sources for One Editor (legacy path discovery)
 
     nonisolated private func readAllEditorEntries(appFolder: String) -> [PathEntry] {
         let base = "\(realHome)/Library/Application Support/\(appFolder)"
@@ -180,11 +287,9 @@ actor WorkspaceDiscoveryEngine {
         }
         defer { sqlite3_close(db) }
 
-        // "history.recentlyOpenedPathsList" stores entries newest-first
-        var entries = querySQLiteEntries(db, key: "history.recentlyOpenedPathsList")
-        entries += querySQLiteEntries(db, key: "workspaceMetadata.entries")
-        log.debug("SQLite read OK: \(entries.count) entries from \(dbPath)")
-        return entries
+        // Only use the primary history key — workspaceMetadata uses a different order
+        // and assigning it rank 0 would corrupt the recent list.
+        return querySQLiteEntries(db, key: "history.recentlyOpenedPathsList")
     }
 
     nonisolated private func readSQLiteFallbackEntries(dbPath: String) -> [PathEntry] {
@@ -197,9 +302,7 @@ actor WorkspaceDiscoveryEngine {
         return querySQLiteEntries(db, key: "history.recentlyOpenedPathsList")
     }
 
-    /// Returns entries in the order they appear in the JSON (newest → oldest).
-    /// Synthetic `lastOpened` dates are assigned so that the recency ORDER is preserved:
-    /// index 0 → most recent, each subsequent entry is 30 minutes older.
+    /// Returns entries in editor recency order (index 0 = most recent).
     nonisolated private func querySQLiteEntries(_ db: OpaquePointer?, key: String) -> [PathEntry] {
         guard let db else { return [] }
         var stmt: OpaquePointer?
@@ -234,29 +337,33 @@ actor WorkspaceDiscoveryEngine {
         }
 
         var result   = [PathEntry]()
-        let baseDate = Date()
+        var nextRank   = 0
 
         // ① windowsState.lastActiveWindow → most recently used (highest priority)
         if let ws = root["windowsState"] as? [String: Any],
            let last = ws["lastActiveWindow"] as? [String: Any] {
-            extractWindowPath(last).map { result.append(PathEntry(path: $0, lastOpened: baseDate.addingTimeInterval(-60))) }
+            extractWindowPath(last).map {
+                result.append(PathEntry(path: $0, recencyRank: nextRank))
+                nextRank += 1
+            }
 
-            // openedWindows: still "very recent"
             if let opened = ws["openedWindows"] as? [[String: Any]] {
-                for (i, w) in opened.enumerated() {
+                for w in opened {
                     extractWindowPath(w).map {
-                        result.append(PathEntry(path: $0, lastOpened: baseDate.addingTimeInterval(-Double(i + 1) * 600)))
+                        result.append(PathEntry(path: $0, recencyRank: nextRank))
+                        nextRank += 1
                     }
                 }
             }
         }
 
-        // ② backupWorkspaces.folders → recently used folders (1–7 days old range)
+        // ② backupWorkspaces.folders → recently used folders
         if let bw = root["backupWorkspaces"] as? [String: Any],
            let folders = bw["folders"] as? [[String: Any]] {
-            for (i, folder) in folders.enumerated() {
+            for folder in folders {
                 if let uri = folder["folderUri"] as? String, let p = uriToPath(uri) {
-                    result.append(PathEntry(path: p, lastOpened: baseDate.addingTimeInterval(-Double(i + 1) * 3600)))
+                    result.append(PathEntry(path: p, recencyRank: nextRank))
+                    nextRank += 1
                 }
             }
         }
@@ -266,7 +373,7 @@ actor WorkspaceDiscoveryEngine {
            let workspaces = pa["workspaces"] as? [String: Any] {
             for uri in workspaces.keys {
                 if let p = uriToPath(uri) {
-                    result.append(PathEntry(path: p, lastOpened: nil))
+                    result.append(PathEntry(path: p, recencyRank: nil))
                 }
             }
         }
@@ -283,27 +390,21 @@ actor WorkspaceDiscoveryEngine {
     // MARK: - JSON Parsers
 
     /// Parses `history.recentlyOpenedPathsList` / `workspaceMetadata.entries` JSON.
-    /// Entries are in newest-first order; we assign dates to preserve that ordering.
-    nonisolated private func parseOrderedEntries(_ jsonString: String) -> [PathEntry] {
+    /// Entries are newest-first; rank preserves that ordering without fake dates.
+    nonisolated private func parseOrderedEntries(_ jsonString: String, rankOffset: Int = 0) -> [PathEntry] {
         guard let data    = jsonString.data(using: .utf8),
               let root    = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let entries = root["entries"] as? [[String: Any]]
         else { return [] }
 
         var result = [PathEntry]()
-        let now    = Date()
 
         for (index, entry) in entries.enumerated() {
             guard let uri = entry["folderUri"] as? String,
                   let path = uriToPath(uri)
             else { continue }
 
-            // Assign a synthetic date that preserves recency order:
-            // index 0 = most recent (2 min ago), each step = 30 min older.
-            // This means "recently opened" entries will naturally sort to the top
-            // without showing fake wall-clock times to the user (we show relative "Xm ago").
-            let syntheticDate = now.addingTimeInterval(-Double(index) * 1800 - 120)
-            result.append(PathEntry(path: path, lastOpened: syntheticDate))
+            result.append(PathEntry(path: path, recencyRank: rankOffset + index))
         }
         return result
     }

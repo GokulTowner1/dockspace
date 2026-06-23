@@ -140,10 +140,12 @@ struct HotkeyRecorderButton: View {
 
 // MARK: - Preview
 
-#Preview {
-    HStack {
-        HotkeyRecorderButton(combo: .constant(.default))
+struct HotkeyRecorderButton_Previews: PreviewProvider {
+    static var previews: some View {
+        HStack {
+            HotkeyRecorderButton(combo: .constant(.default))
+        }
+        .padding()
+        .frame(width: 300, height: 60)
     }
-    .padding()
-    .frame(width: 300, height: 60)
 }

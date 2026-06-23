@@ -9,7 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     let appState    = AppState()
     var panelManager: FloatingPanelManager!
-    var welcomeManager: WelcomeWindowManager!
+    var welcomeManager: WelcomeWindowManager?
+    var automationWindowManager: AutomationWindowManager!
     let hotkeyEngine = HotkeyEngine()
 
     private var cancellables = Set<AnyCancellable>()
@@ -17,20 +18,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if let icon = DockspaceLogo.nsImage(size: 512) {
+        if let icon = DockspaceLogo.nsImage(size: 128) {
             NSApp.applicationIconImage = icon
         }
 
         // Run as menu bar-only app — no Dock icon
         NSApp.setActivationPolicy(.accessory)
 
-        // 1. Build the floating panel (done eagerly so first show is instant)
+        // 1. Build the floating panel manager (panel is created lazily on first show)
         panelManager = FloatingPanelManager(appState: appState)
+        automationWindowManager = AutomationWindowManager(appState: appState)
 
-        // 2. First-run welcome (non-blocking; panel + hotkey are already live)
-        welcomeManager = WelcomeWindowManager(appState: appState)
-        welcomeManager.configure { [weak self] in
-            self?.openSettings()
+        // 2. First-run welcome (skipped entirely when onboarding is already complete)
+        if WelcomeWindowManager.shouldShow {
+            let welcome = WelcomeWindowManager(appState: appState)
+            welcome.configure { [weak self] in
+                self?.openSettings()
+            }
+            welcomeManager = welcome
         }
 
         // 3. Wire the hotkey engine
@@ -46,17 +51,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        // 5. Preload official technology logos (disk cache → CDN)
-        ProjectIconCache.shared.preloadAll()
-
-        // 6. Initial workspace discovery — bypass cooldown so it always runs at launch
-        Task {
-            await appState.forceRefresh()
-        }
-
-        // 7. Show onboarding after core services are ready
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            self?.welcomeManager.showIfNeeded()
+        // 5. Workspace list is loaded from disk cache in AppState.init.
+        // Discovery runs on first launcher open (refreshIfStale) to keep idle memory low.
+        if let welcomeManager {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                welcomeManager.showIfNeeded()
+            }
         }
     }
 

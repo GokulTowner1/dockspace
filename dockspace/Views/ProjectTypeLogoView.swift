@@ -12,7 +12,7 @@ struct ProjectTypeLogoView: View {
     var showsBackground: Bool = false
 
     @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var iconCache = ProjectIconCache.shared
+    @State private var loadedImage: NSImage?
 
     private var needsLightBackdrop: Bool {
         colorScheme == .dark && projectType.logoNeedsLightBackdrop
@@ -20,8 +20,8 @@ struct ProjectTypeLogoView: View {
 
     var body: some View {
         Group {
-            if let nsImage = iconCache.image(for: projectType) {
-                Image(nsImage: nsImage)
+            if let loadedImage {
+                Image(nsImage: loadedImage)
                     .resizable()
                     .interpolation(.high)
                     .antialiased(true)
@@ -40,10 +40,19 @@ struct ProjectTypeLogoView: View {
         .frame(width: size, height: size)
         .padding(padding)
         .background(backgroundShape)
-        .onAppear {
-            iconCache.ensureLoaded(projectType)
+        .onAppear(perform: loadIconIfNeeded)
+        .onChange(of: projectType) { _, _ in
+            loadedImage = nil
+            loadIconIfNeeded()
         }
-        .onChange(of: iconCache.revision) { _, _ in }
+    }
+
+    private func loadIconIfNeeded() {
+        guard projectType != .unknown else { return }
+        loadedImage = ProjectIconCache.shared.image(for: projectType)
+        ProjectIconCache.shared.ensureLoaded(projectType) { image in
+            loadedImage = image
+        }
     }
 
     @ViewBuilder
@@ -68,7 +77,7 @@ struct ProjectTypeLogoView: View {
 struct WorkspaceProjectIconView: View {
     let projectType: ProjectType
 
-    @ObservedObject private var iconCache = ProjectIconCache.shared
+    @State private var loadedImage: NSImage?
 
     private let tileSize: CGFloat = 36
     private let logoSize: CGFloat = 22
@@ -96,7 +105,7 @@ struct WorkspaceProjectIconView: View {
                 Image(systemName: "folder.fill")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(.secondary)
-            } else if iconCache.image(for: projectType) != nil {
+            } else if loadedImage != nil {
                 ProjectTypeLogoView(projectType: projectType, size: logoSize)
             } else {
                 ProgressView()
@@ -104,11 +113,18 @@ struct WorkspaceProjectIconView: View {
                     .frame(width: logoSize, height: logoSize)
             }
         }
-        .onAppear {
-            if projectType != .unknown {
-                iconCache.ensureLoaded(projectType)
-            }
+        .onAppear(perform: loadIconIfNeeded)
+        .onChange(of: projectType) { _, _ in
+            loadedImage = nil
+            loadIconIfNeeded()
         }
-        .onChange(of: iconCache.revision) { _, _ in }
+    }
+
+    private func loadIconIfNeeded() {
+        guard projectType != .unknown else { return }
+        loadedImage = ProjectIconCache.shared.image(for: projectType)
+        ProjectIconCache.shared.ensureLoaded(projectType) { image in
+            loadedImage = image
+        }
     }
 }

@@ -18,6 +18,11 @@ final class FloatingPanel: NSPanel {
 
 private final class PanelWindowDelegate: NSObject, NSWindowDelegate {
     var onResignKey: (() -> Void)?
+    var onBecomeKey: (() -> Void)?
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        onBecomeKey?()
+    }
 
     func windowDidResignKey(_ notification: Notification) {
         log.info("Panel resigned key – hiding")
@@ -48,9 +53,6 @@ final class FloatingPanelManager {
     init(appState: AppState) {
         self.appState = appState
 
-        // Build the panel eagerly so it's ready on first hotkey press
-        buildPanel()
-
         // Register closures into AppState so any SwiftUI view can trigger
         // the panel without relying on NSApp.delegate, which SwiftUI wraps
         // in its own proxy class (SwiftUI.AppDelegate) and cannot be cast.
@@ -73,13 +75,18 @@ final class FloatingPanelManager {
     // before we try to activate the app and make the panel key.
 
     func show(fromMenuBar: Bool = false) {
+        if panel == nil {
+            buildPanel()
+        }
+
         guard let panel else {
-            log.error("show() called but panel is nil – this should not happen")
+            log.error("show() called but panel could not be built")
             return
         }
 
         if panel.isVisible {
-            log.info("show() – panel already visible, skipping")
+            log.info("show() – panel already visible, refocusing search")
+            performShow(panel)
             return
         }
 
@@ -95,9 +102,7 @@ final class FloatingPanelManager {
 
         centerPanel(panel)
         appState.resetSearch()
-        // Silently refresh workspace list if it's been > 2 min since last discovery.
-        // This keeps data fresh without any continuous background work.
-        appState.refreshIfStale()
+        appState.prepareForActiveUse()
 
         panel.alphaValue = 0
 
@@ -131,6 +136,28 @@ final class FloatingPanelManager {
         }
 
         startMonitors()
+        focusSearchField(in: panel)
+    }
+
+    /// Moves keyboard focus into the search field after the panel is key.
+    private func focusSearchField(in panel: NSPanel) {
+        appState.requestSearchFieldFocus()
+
+        // First responder pass — helps AppKit wire focus before SwiftUI catches up.
+        DispatchQueue.main.async {
+            panel.makeKey()
+            if let hosting = panel.contentView {
+                panel.makeFirstResponder(hosting)
+            }
+            self.appState.requestSearchFieldFocus()
+        }
+
+        // Fallback for slower window activation (menu bar, hotkey from background app).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self, let panel = self.panel, panel.isVisible else { return }
+            panel.makeKeyAndOrderFront(nil)
+            self.appState.requestSearchFieldFocus()
+        }
     }
 
     // MARK: - Hide
@@ -183,6 +210,9 @@ final class FloatingPanelManager {
         // Window delegate: auto-hide when panel loses key status (user clicked elsewhere)
         panelDelegate.onResignKey = { [weak self] in
             DispatchQueue.main.async { self?.hide() }
+        }
+        panelDelegate.onBecomeKey = { [weak self] in
+            DispatchQueue.main.async { self?.appState.requestSearchFieldFocus() }
         }
         panel.delegate = panelDelegate
 

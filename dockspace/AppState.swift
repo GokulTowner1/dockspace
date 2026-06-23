@@ -11,10 +11,16 @@ final class AppState: ObservableObject {
     @Published var filteredWorkspaces: [Workspace] = []
     @Published var selectedIndex: Int = 0
     @Published var isLoading: Bool    = false
+    @Published var isSearching: Bool  = false
+    @Published var automationsByWorkspacePath: [String: WorkspaceAutomation] = [:]
 
-    /// Writing to this triggers debounced search (50 ms).
-    @Published var searchText: String = "" {
-        didSet { scheduleSearch() }
+    @Published var searchText: String = ""
+
+    /// Incremented each time the launcher opens — drives search-field focus.
+    @Published private(set) var searchFocusGeneration: Int = 0
+
+    @Published var activeFilter: WorkspaceFilter = .all {
+        didSet { clampSelection() }
     }
 
     // MARK: - Hotkey Combo (persisted, drives real-time re-registration)
@@ -28,40 +34,79 @@ final class AppState: ObservableObject {
     var showLauncher: (() -> Void)?
     var toggleLauncher: (() -> Void)?
     var hideLauncher: (() -> Void)?
+    var showAutomation: ((Workspace) -> Void)?
 
     // MARK: - Engines
 
-    private let discoveryEngine = WorkspaceDiscoveryEngine()
+    private lazy var discoveryEngine = WorkspaceDiscoveryEngine()
     private let searchEngine    = SearchEngine()
     private let cacheEngine     = CacheEngine()
+    private let automationStore = AutomationStore()
     let launchEngine             = LaunchEngine()
+    let automationEngine          = AutomationEngine()
+    lazy var automationRecorder   = WorkspaceAutomationRecorder()
     private var fileWatcher: FileWatcherEngine?
+    private var cancellables = Set<AnyCancellable>()
+    private var automationsLoaded = false
+    private var automationStepCounts: [String: Int] = [:]
 
     /// Guards against running discovery more frequently than this interval.
     /// 0% CPU when idle — discovery only runs at launch + on panel-open if stale.
     private var lastDiscoveryTime: Date = .distantPast
     private let discoveryMinInterval: TimeInterval = 120   // 2 minutes
 
-    // MARK: - Search Debounce
+    /// Debounced search pipeline — reliable on MainActor, avoids didSet races.
+    private static let searchDebounce: RunLoop.SchedulerTimeType.Stride = .milliseconds(120)
 
-    private var searchTask: Task<Void, Never>?
+    // MARK: - Displayed List (single source of truth for UI + keyboard nav)
 
-    private func scheduleSearch() {
-        searchTask?.cancel()
-        searchTask = Task { [weak self] in
-            // 50 ms debounce: lets the user type without a search on every keystroke
-            try? await Task.sleep(nanoseconds: 50_000_000)
-            guard !Task.isCancelled else { return }
-            self?.performSearch()
-        }
+    /// Workspaces after search *and* the active filter tab — used by the palette and arrow keys.
+    var displayedWorkspaces: [Workspace] {
+        applyFilter(activeFilter, to: filteredWorkspaces)
+    }
+
+    var isSearchActive: Bool {
+        !normalizedSearchQuery.isEmpty
+    }
+
+    private var normalizedSearchQuery: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Init
 
     init() {
-        let cached = cacheEngine.loadWorkspaces()
+        let cached = cacheEngine.loadWorkspaces().map(WorkspaceRecency.sanitizeCached)
         workspaces         = cached
-        filteredWorkspaces = cached   // already sorted by cache (most recent first)
+        filteredWorkspaces = sortedWorkspaces(cached)
+        automationStepCounts = automationStore.loadEnabledStepCounts()
+
+        automationEngine.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+
+        bindSearchPipeline()
+        refreshEditorHistoryRanks()
+    }
+
+    private func bindSearchPipeline() {
+        $searchText
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .removeDuplicates()
+            .handleEvents(receiveOutput: { [weak self] query in
+                self?.isSearching = !query.isEmpty
+                if !query.isEmpty, self?.activeFilter != .all {
+                    self?.activeFilter = .all
+                }
+            })
+            .debounce(for: Self.searchDebounce, scheduler: RunLoop.main)
+            .sink { [weak self] query in
+                self?.applySearch(query: query)
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Discovery
@@ -82,10 +127,38 @@ final class AppState: ObservableObject {
         performSearch()
         cacheEngine.saveWorkspaces(valid)
         isLoading = false
-        startFileWatcher()
     }
 
     /// Called by FloatingPanelManager when the panel opens.
+    /// Starts background services and refreshes editor history order.
+    func prepareForActiveUse() {
+        startFileWatcher()
+        refreshEditorHistoryRanks()
+        refreshIfStale()
+    }
+
+    /// Lightweight refresh of editor recency ranks from Cursor / VS Code history.
+    /// Runs on every panel open so the recent list matches the editor immediately.
+    func refreshEditorHistoryRanks() {
+        let ranks = WorkspaceDiscoveryEngine.currentEditorRanks()
+        guard !ranks.isEmpty else { return }
+
+        var changed = false
+        for index in workspaces.indices {
+            let path = workspaces[index].path
+            guard let rank = ranks[path] else { continue }
+            if workspaces[index].editorRecencyRank != rank {
+                workspaces[index].editorRecencyRank = rank
+                changed = true
+            }
+        }
+
+        if changed {
+            cacheEngine.saveWorkspaces(workspaces)
+            performSearch()
+        }
+    }
+
     /// Silently refreshes in the background if data is stale (> 2 min old).
     func refreshIfStale() {
         guard !isLoading else { return }
@@ -102,13 +175,43 @@ final class AppState: ObservableObject {
     // MARK: - Search
 
     func performSearch() {
-        let q = searchText.trimmingCharacters(in: .whitespaces)
-        if q.isEmpty {
+        applySearch(query: normalizedSearchQuery)
+    }
+
+    private func applySearch(query: String) {
+        if query.isEmpty {
             filteredWorkspaces = sortedWorkspaces(workspaces)
         } else {
-            filteredWorkspaces = searchEngine.search(query: q, in: workspaces)
+            filteredWorkspaces = searchEngine.search(query: query, in: workspaces)
         }
+        isSearching = false
         selectedIndex = 0
+    }
+
+    func applyFilter(_ filter: WorkspaceFilter, to base: [Workspace]) -> [Workspace] {
+        switch filter {
+        case .all:
+            return base
+        case .favorites:
+            return base.filter(\.isFavorite)
+        case .recent:
+            return WorkspaceRecency.recent(from: base)
+        case .appType(let t):
+            return base.filter { $0.appType == t }
+        case .projectType(let t):
+            return base.filter { $0.projectType == t }
+        }
+    }
+
+    private func clampSelection() {
+        let count = displayedWorkspaces.count
+        guard count > 0 else {
+            selectedIndex = 0
+            return
+        }
+        if selectedIndex >= count {
+            selectedIndex = count - 1
+        }
     }
 
     // MARK: - Workspace Actions
@@ -116,9 +219,158 @@ final class AppState: ObservableObject {
     func openWorkspace(_ workspace: Workspace) {
         var updated = workspace
         updated.launchCount += 1
-        updated.lastOpened = Date()   // accurate timestamp from actual Dockspace open
-        updateWorkspace(updated)
+        updated.lastOpened = Date()
+        updated.editorRecencyRank = 0
+        WorkspaceRecency.bumpToTop(path: workspace.path, in: &workspaces)
+        if let idx = workspaces.firstIndex(where: { $0.path == workspace.path }) {
+            workspaces[idx] = updated
+        }
+        cacheEngine.saveWorkspaces(workspaces)
+        performSearch()
         launchEngine.open(workspace)
+    }
+
+    func runWorkspaceAutomation(_ workspace: Workspace) {
+        var updated = workspace
+        updated.launchCount += 1
+        updated.lastOpened = Date()
+        updated.editorRecencyRank = 0
+        WorkspaceRecency.bumpToTop(path: workspace.path, in: &workspaces)
+        if let idx = workspaces.firstIndex(where: { $0.path == workspace.path }) {
+            workspaces[idx] = updated
+        }
+        cacheEngine.saveWorkspaces(workspaces)
+        performSearch()
+
+        automationEngine.run(runnableAutomation(for: updated), for: updated)
+    }
+
+    func openAutomationEditor(for workspace: Workspace) {
+        showAutomation?(workspace)
+    }
+
+    func automation(for workspace: Workspace) -> WorkspaceAutomation {
+        ensureAutomationsLoaded()
+        return automationsByWorkspacePath[workspace.path] ?? .starter(for: workspace)
+    }
+
+    func savedAutomation(for workspace: Workspace) -> WorkspaceAutomation? {
+        ensureAutomationsLoaded()
+        return automationsByWorkspacePath[workspace.path]
+    }
+
+    func runnableAutomation(for workspace: Workspace) -> WorkspaceAutomation {
+        ensureAutomationsLoaded()
+        return automationsByWorkspacePath[workspace.path] ?? .starter(for: workspace)
+    }
+
+    func automationRunState(for workspace: Workspace) -> AutomationRunState {
+        automationEngine.runsByWorkspacePath[workspace.path] ?? .idle(for: workspace.path)
+    }
+
+    func automationStepCount(for workspace: Workspace) -> Int {
+        automationStepCounts[workspace.path] ?? 0
+    }
+
+    func saveAutomation(_ automation: WorkspaceAutomation) {
+        ensureAutomationsLoaded()
+        var updated = automation
+        updated.updatedAt = Date()
+        automationsByWorkspacePath[updated.workspacePath] = updated
+        automationStepCounts[updated.workspacePath] = updated.enabledStepCount
+        automationStore.saveAutomations(automationsByWorkspacePath)
+    }
+
+    func updateAutomation(for workspace: Workspace, mutate: (inout WorkspaceAutomation) -> Void) {
+        var automation = automation(for: workspace)
+        mutate(&automation)
+        saveAutomation(automation)
+    }
+
+    func addAutomationStep(_ step: AutomationStep, to workspace: Workspace) {
+        updateAutomation(for: workspace) { automation in
+            automation.steps.append(step)
+        }
+    }
+
+    func moveAutomationSteps(for workspace: Workspace, from source: IndexSet, to destination: Int) {
+        updateAutomation(for: workspace) { automation in
+            let moving = source.sorted().map { automation.steps[$0] }
+            for index in source.sorted(by: >) {
+                automation.steps.remove(at: index)
+            }
+            let removedBeforeDestination = source.filter { $0 < destination }.count
+            let adjustedDestination = max(0, min(automation.steps.count, destination - removedBeforeDestination))
+            automation.steps.insert(contentsOf: moving, at: adjustedDestination)
+        }
+    }
+
+    func deleteAutomationSteps(for workspace: Workspace, at offsets: IndexSet) {
+        updateAutomation(for: workspace) { automation in
+            for index in offsets.sorted(by: >) {
+                automation.steps.remove(at: index)
+            }
+        }
+    }
+
+    func duplicateAutomationStep(_ step: AutomationStep, for workspace: Workspace) {
+        updateAutomation(for: workspace) { automation in
+            guard let index = automation.steps.firstIndex(where: { $0.id == step.id }) else { return }
+            var copy = step
+            copy.id = UUID()
+            copy.title = "\(step.title) Copy"
+            copy.createdAt = Date()
+            automation.steps.insert(copy, at: automation.steps.index(after: index))
+        }
+    }
+
+    func toggleAutomationStep(_ step: AutomationStep, for workspace: Workspace) {
+        updateAutomation(for: workspace) { automation in
+            guard let index = automation.steps.firstIndex(where: { $0.id == step.id }) else { return }
+            automation.steps[index].isEnabled.toggle()
+        }
+    }
+
+    func replaceAutomationStep(_ step: AutomationStep, for workspace: Workspace) {
+        updateAutomation(for: workspace) { automation in
+            guard let index = automation.steps.firstIndex(where: { $0.id == step.id }) else { return }
+            automation.steps[index] = step
+        }
+    }
+
+    func startAutomationRecording(for workspace: Workspace) {
+        automationRecorder.startRecording(for: workspace)
+    }
+
+    @discardableResult
+    func stopAutomationRecording(for workspace: Workspace) -> Int {
+        let captured = automationRecorder.stopRecording()
+        guard !captured.isEmpty else { return 0 }
+
+        updateAutomation(for: workspace) { automation in
+            automation.steps.append(contentsOf: captured)
+        }
+        return captured.count
+    }
+
+    func discardAutomationRecording() {
+        automationRecorder.discardRecording()
+    }
+
+    func captureFrontmostWindowLayout(for workspace: Workspace) throws {
+        let wasRecording = automationRecorder.isRecording
+        let previousCount = automationRecorder.capturedSteps.count
+        let layout = try automationRecorder.recordCurrentWindowLayout()
+        updateAutomation(for: workspace) { automation in
+            if !automation.windowLayouts.contains(where: { $0.id == layout.id }) {
+                automation.windowLayouts.append(layout)
+            }
+            if !wasRecording,
+               automationRecorder.capturedSteps.count > previousCount,
+               let step = automationRecorder.capturedSteps.last {
+                automation.steps.append(step)
+            }
+        }
     }
 
     func toggleFavorite(_ workspace: Workspace) {
@@ -136,39 +388,47 @@ final class AppState: ObservableObject {
     // MARK: - Keyboard Navigation
 
     func moveSelectionUp() {
-        guard !filteredWorkspaces.isEmpty else { return }
-        selectedIndex = (selectedIndex - 1 + filteredWorkspaces.count) % filteredWorkspaces.count
+        let items = displayedWorkspaces
+        guard !items.isEmpty else { return }
+        selectedIndex = (selectedIndex - 1 + items.count) % items.count
     }
 
     func moveSelectionDown() {
-        guard !filteredWorkspaces.isEmpty else { return }
-        selectedIndex = (selectedIndex + 1) % filteredWorkspaces.count
+        let items = displayedWorkspaces
+        guard !items.isEmpty else { return }
+        selectedIndex = (selectedIndex + 1) % items.count
     }
 
     func openSelected() -> Bool {
-        guard selectedIndex < filteredWorkspaces.count else { return false }
-        openWorkspace(filteredWorkspaces[selectedIndex])
+        let items = displayedWorkspaces
+        guard selectedIndex < items.count else { return false }
+        openWorkspace(items[selectedIndex])
         return true
     }
 
     var selectedWorkspace: Workspace? {
-        guard selectedIndex < filteredWorkspaces.count else { return nil }
-        return filteredWorkspaces[selectedIndex]
+        let items = displayedWorkspaces
+        guard selectedIndex < items.count else { return nil }
+        return items[selectedIndex]
     }
 
     func resetSearch() {
         searchText    = ""
+        activeFilter  = .all
         selectedIndex = 0
+        performSearch()
+    }
+
+    /// Called when the launcher panel becomes visible — focuses the search field.
+    func requestSearchFieldFocus() {
+        searchFocusGeneration += 1
     }
 
     // MARK: - Computed Subsets (used by the UI)
 
-    /// Workspaces opened within the last 30 days, sorted most-recent first.
+    /// Workspaces matching the editor's recent list (top 12).
     var recentWorkspaces: [Workspace] {
-        let cutoff = Date().addingTimeInterval(-30 * 24 * 3600)
-        return workspaces
-            .filter { ($0.lastOpened ?? .distantPast) > cutoff }
-            .sorted { ($0.lastOpened ?? .distantPast) > ($1.lastOpened ?? .distantPast) }
+        WorkspaceRecency.recentSection(from: workspaces)
     }
 
     var favoriteWorkspaces: [Workspace] {
@@ -191,9 +451,9 @@ final class AppState: ObservableObject {
     ///
     /// Merge rules for each discovered workspace:
     /// - If it already exists in the cache:
-    ///   • Keep the **more recent** `lastOpened` (accurate Dockspace opens vs history estimate)
-    ///   • Keep cached `isFavorite` / `launchCount`
-    ///   • Keep cached `projectType` (avoids redundant FS detection on every refresh)
+    ///   • Keep user `lastOpened` / `launchCount` / `isFavorite`
+    ///   • Merge `editorRecencyRank` (lower = more recent)
+    ///   • Keep cached `projectType` detection in sync on refresh
     /// - If it is new: use the discovered data as-is.
     private func mergeWorkspaces(existing: [Workspace], new: [Workspace]) -> [Workspace] {
         // Build O(1) lookup
@@ -203,24 +463,18 @@ final class AppState: ObservableObject {
         var result = [Workspace]()
         result.reserveCapacity(max(existing.count, new.count))
 
-        var seen = Set<String>()
-
         for discovered in new {
-            seen.insert(discovered.path)
-
             if let old = cached[discovered.path] {
-                // Existing workspace — merge
-                var merged = old
-                merged.name = discovered.name  // reflect renames
+                var merged = WorkspaceRecency.sanitizeCached(old)
+                merged.name = discovered.name
 
-                // Keep the more-recent date (real Dockspace opens beat history estimate)
-                switch (old.lastOpened, discovered.lastOpened) {
-                case (.some(let a), .some(let b)): merged.lastOpened = max(a, b)
-                case (.none, .some(let b)):        merged.lastOpened = b
-                case (.some, .none), (.none, .none): break
+                switch (old.editorRecencyRank, discovered.editorRecencyRank) {
+                case (.some(let a), .some(let b)): merged.editorRecencyRank = min(a, b)
+                case (.none, .some(let b)):        merged.editorRecencyRank = b
+                case (.some(let a), .none):        merged.editorRecencyRank = a
+                case (.none, .none):               break
                 }
 
-                // Re-detect on every refresh so improved rules stay in sync
                 merged.projectType = discovered.projectType
                 result.append(merged)
             } else {
@@ -228,24 +482,16 @@ final class AppState: ObservableObject {
             }
         }
 
-        // Keep cached workspaces that are no longer on disk? No — discovery already
-        // passes through FileManager.fileExists, so drop them.
         return result
     }
 
-    /// Sorts workspaces: most-recently-opened first, then alphabetical.
+    /// Sorts workspaces: favorites → editor history rank → name.
     private func sortedWorkspaces(_ list: [Workspace]) -> [Workspace] {
         list.sorted { a, b in
-            // Favorites always float to the very top
             if a.isFavorite != b.isFavorite { return a.isFavorite }
-
-            switch (a.lastOpened, b.lastOpened) {
-            case (.some(let da), .some(let db)): return da > db
-            case (.some, .none):                 return true
-            case (.none, .some):                 return false
-            case (.none, .none):
-                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
-            }
+            let byHistory = WorkspaceRecency.sortByEditorHistory(a, b)
+            if a.editorRecencyRank != b.editorRecencyRank { return byHistory }
+            return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
         }
     }
 
@@ -260,6 +506,15 @@ final class AppState: ObservableObject {
                 self.lastDiscoveryTime = .distantPast   // allow immediate re-run
                 await self.discoverWorkspaces()
             }
+        }
+    }
+
+    private func ensureAutomationsLoaded() {
+        guard !automationsLoaded else { return }
+        automationsLoaded = true
+        automationsByWorkspacePath = automationStore.loadAutomations()
+        for (path, automation) in automationsByWorkspacePath {
+            automationStepCounts[path] = automation.enabledStepCount
         }
     }
 }

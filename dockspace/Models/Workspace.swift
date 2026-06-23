@@ -158,6 +158,80 @@ struct GitInfo: Codable, Hashable {
     var behindCount: Int
 }
 
+// MARK: - Workspace Recency
+
+enum WorkspaceRecency {
+    /// Editor-history entries within this rank are treated as "recent".
+    static let editorRankThreshold = 12
+    /// Max items shown in the "Recently Opened" section and menu.
+    static let recentSectionLimit = 12
+    /// User-opened workspaces stay "recent" for this many days.
+    static let userOpenDays: TimeInterval = 30 * 24 * 3600
+
+    static func isRecentlyUsed(_ workspace: Workspace) -> Bool {
+        if hasUserOpen(within: userOpenDays, workspace: workspace) { return true }
+        if let rank = workspace.editorRecencyRank, rank < editorRankThreshold { return true }
+        return false
+    }
+
+    static func hasUserOpen(within window: TimeInterval, workspace: Workspace) -> Bool {
+        guard workspace.launchCount > 0, let opened = workspace.lastOpened else { return false }
+        return Date().timeIntervalSince(opened) < window
+    }
+
+    /// Sorts by editor history rank — matches Cursor / VS Code "Recent" order.
+    static func sortByEditorHistory(_ a: Workspace, _ b: Workspace) -> Bool {
+        switch (a.editorRecencyRank, b.editorRecencyRank) {
+        case (.some(let ra), .some(let rb)):
+            if ra != rb { return ra < rb }
+        case (.some, .none): return true
+        case (.none, .some): return false
+        case (.none, .none): break
+        }
+
+        // Tie-break: Dockspace opens, then name.
+        if a.launchCount > 0, b.launchCount > 0,
+           let da = a.lastOpened, let db = b.lastOpened, da != db {
+            return da > db
+        }
+        return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+    }
+
+    /// Recent list for menus — editor order first, capped.
+    static func recent(from workspaces: [Workspace]) -> [Workspace] {
+        recentSection(from: workspaces, limit: recentSectionLimit)
+    }
+
+    /// Ordered "Recently Opened" section — mirrors the editor's recent list.
+    static func recentSection(from workspaces: [Workspace], limit: Int = recentSectionLimit) -> [Workspace] {
+        workspaces
+            .filter(isRecentlyUsed)
+            .sorted(by: sortByEditorHistory)
+            .prefix(limit)
+            .map { $0 }
+    }
+
+    /// Clears `lastOpened` values that came from older discovery heuristics
+    /// (synthetic dates assigned before the user ever opened via Dockspace).
+    static func sanitizeCached(_ workspace: Workspace) -> Workspace {
+        var ws = workspace
+        if ws.launchCount == 0 { ws.lastOpened = nil }
+        return ws
+    }
+
+    /// Moves one workspace to rank 0 and shifts other ranked items down.
+    static func bumpToTop(path: String, in workspaces: inout [Workspace]) {
+        guard workspaces.contains(where: { $0.path == path }) else { return }
+        for index in workspaces.indices {
+            if workspaces[index].path == path {
+                workspaces[index].editorRecencyRank = 0
+            } else if let rank = workspaces[index].editorRecencyRank {
+                workspaces[index].editorRecencyRank = rank + 1
+            }
+        }
+    }
+}
+
 // MARK: - Workspace
 
 struct Workspace: Identifiable, Codable, Hashable {
@@ -166,7 +240,10 @@ struct Workspace: Identifiable, Codable, Hashable {
     var path: String
     var appType: AppType
     var projectType: ProjectType
+    /// Set only when the user opens a workspace through Dockspace.
     var lastOpened: Date?
+    /// Lower values are more recent in the editor's open-history (Cursor / VS Code).
+    var editorRecencyRank: Int?
     var launchCount: Int
     var isFavorite: Bool
     var gitInfo: GitInfo?
@@ -178,6 +255,7 @@ struct Workspace: Identifiable, Codable, Hashable {
         appType: AppType = .cursor,
         projectType: ProjectType = .unknown,
         lastOpened: Date? = nil,
+        editorRecencyRank: Int? = nil,
         launchCount: Int = 0,
         isFavorite: Bool = false,
         gitInfo: GitInfo? = nil,
@@ -188,6 +266,7 @@ struct Workspace: Identifiable, Codable, Hashable {
         self.appType = appType
         self.projectType = projectType
         self.lastOpened = lastOpened
+        self.editorRecencyRank = editorRecencyRank
         self.launchCount = launchCount
         self.isFavorite = isFavorite
         self.gitInfo = gitInfo
@@ -201,11 +280,25 @@ struct Workspace: Identifiable, Codable, Hashable {
         return path.replacingOccurrences(of: home, with: "~")
     }
 
+    /// True when the user has opened this workspace through Dockspace at least once.
+    var hasUserOpened: Bool {
+        launchCount > 0 && lastOpened != nil
+    }
+
     var timeAgoString: String {
-        guard let date = lastOpened else { return "Never opened" }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: Date())
+        if hasUserOpened, let date = lastOpened {
+            let formatter = RelativeDateTimeFormatter()
+            formatter.unitsStyle = .abbreviated
+            return formatter.localizedString(for: date, relativeTo: Date())
+        }
+        if let rank = editorRecencyRank, rank < WorkspaceRecency.editorRankThreshold {
+            return rank == 0 ? "Active in editor" : "In editor history"
+        }
+        return "Never opened"
+    }
+
+    var showsRecencyBadge: Bool {
+        hasUserOpened || (editorRecencyRank.map { $0 < WorkspaceRecency.editorRankThreshold } ?? false)
     }
 
     var exists: Bool {

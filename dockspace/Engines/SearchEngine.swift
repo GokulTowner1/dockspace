@@ -31,6 +31,10 @@ struct SearchEngine {
         let name = workspace.name.lowercased()
         let language = languageSearchTerms(for: workspace.projectType)
         let pathSegments = meaningfulPathSegments(for: workspace.path)
+        let appType = workspace.appType.rawValue.lowercased()
+        let tags = workspace.tags.map { $0.lowercased() }
+        let displayPath = workspace.displayPath.lowercased()
+        let branch = workspace.gitInfo?.branch.lowercased()
 
         // Every token must match at least one searchable field.
         var textScore: Double = 0
@@ -39,7 +43,11 @@ struct SearchEngine {
                 token: token,
                 name: name,
                 language: language,
-                pathSegments: pathSegments
+                pathSegments: pathSegments,
+                appType: appType,
+                tags: tags,
+                displayPath: displayPath,
+                branch: branch
             )
             guard tokenScore > 0 else { return 0 }
             textScore += tokenScore
@@ -49,9 +57,11 @@ struct SearchEngine {
         var total = textScore
         if workspace.isFavorite { total += 30 }
 
-        if let lastOpened = workspace.lastOpened {
+        if workspace.hasUserOpened, let lastOpened = workspace.lastOpened {
             let hoursAgo = Date().timeIntervalSince(lastOpened) / 3600
             total += max(0, 20 - hoursAgo * 0.1)
+        } else if let rank = workspace.editorRecencyRank {
+            total += max(0, 15 - Double(rank))
         }
 
         total += min(Double(workspace.launchCount), 10)
@@ -62,7 +72,11 @@ struct SearchEngine {
         token: String,
         name: String,
         language: [String],
-        pathSegments: [String]
+        pathSegments: [String],
+        appType: String,
+        tags: [String],
+        displayPath: String,
+        branch: String?
     ) -> Double {
         var best: Double = 0
 
@@ -72,11 +86,24 @@ struct SearchEngine {
             best = max(best, scoreLanguage(token: token, term: term))
         }
 
-        // Path is useful for folder names (e.g. "towner", "synamic") but skip
-        // for very short tokens — "doc" would otherwise match "documents" everywhere.
+        best = max(best, scoreLanguage(token: token, term: appType))
+
+        for tag in tags {
+            best = max(best, scoreLanguage(token: token, term: tag))
+        }
+
+        if let branch {
+            best = max(best, scoreLanguage(token: token, term: branch))
+        }
+
         if token.count >= 3 {
             for segment in pathSegments {
                 best = max(best, scorePathSegment(token: token, segment: segment))
+            }
+        } else if token.count == 2 {
+            // Short tokens: prefix / boundary matches on path folders only.
+            for segment in pathSegments {
+                if segment.hasPrefix(token) { best = max(best, 110) }
             }
         }
 
@@ -88,24 +115,27 @@ struct SearchEngine {
     private func scoreName(token: String, name: String) -> Double {
         if name == token { return 1000 }
         if name.hasPrefix(token) { return 500 }
-        if name.contains(token) { return 250 }
+        if token.count >= 3, name.contains(token) { return 250 }
 
-        let fuzzy = fuzzyScore(query: token, target: name)
-        if fuzzy > 0 { return fuzzy * 120 }
+        // Fuzzy match only for 3+ character queries to avoid noisy short matches.
+        if token.count >= 3 {
+            let fuzzy = fuzzyScore(query: token, target: name)
+            if fuzzy > 0 { return fuzzy * 120 }
+        }
         return 0
     }
 
     private func scoreLanguage(token: String, term: String) -> Double {
         if term == token { return 400 }
         if term.hasPrefix(token) { return 220 }
-        if term.contains(token) { return 120 }
+        if token.count >= 3, term.contains(token) { return 120 }
         return 0
     }
 
     private func scorePathSegment(token: String, segment: String) -> Double {
         if segment == token { return 180 }
         if segment.hasPrefix(token) { return 110 }
-        if segment.contains(token) { return 70 }
+        if token.count >= 3, segment.contains(token) { return 70 }
         return 0
     }
 

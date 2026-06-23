@@ -74,28 +74,12 @@ struct CommandPaletteView: View {
 
     @FocusState private var searchFocused: Bool
     @State private var didAppear       = false
-    @State private var activeFilter: WorkspaceFilter = .all
     @State private var scrollPosition: String?
 
     // MARK: - Pre-computed data
 
-    /// The subset of workspaces that pass the active filter + search.
     private var displayedWorkspaces: [Workspace] {
-        let base = appState.filteredWorkspaces
-        switch activeFilter {
-        case .all:
-            return base
-        case .favorites:
-            return base.filter { $0.isFavorite }
-        case .recent:
-            return base
-                .filter { $0.lastOpened != nil }
-                .sorted { ($0.lastOpened ?? .distantPast) > ($1.lastOpened ?? .distantPast) }
-        case .appType(let t):
-            return base.filter { $0.appType == t }
-        case .projectType(let t):
-            return base.filter { $0.projectType == t }
-        }
+        appState.displayedWorkspaces
     }
 
     /// Flat row list for the scroll view. Sections are inlined so LazyVStack
@@ -108,7 +92,7 @@ struct CommandPaletteView: View {
         var result = [SectionRow]()
 
         // While typing or filtering: flat list, fastest path
-        if !appState.searchText.isEmpty || activeFilter != .all {
+        if appState.isSearchActive || appState.activeFilter != .all {
             result.reserveCapacity(items.count)
             for (idx, ws) in items.enumerated() {
                 result.append(.workspace(ws, globalIndex: idx))
@@ -116,10 +100,14 @@ struct CommandPaletteView: View {
             return result
         }
 
-        // Default grouped view: Favorites → Recently Opened → All
-        let favorites = items.filter { $0.isFavorite }
-        let recently  = items.filter { !$0.isFavorite && $0.lastOpened != nil }
-        let rest      = items.filter { !$0.isFavorite && $0.lastOpened == nil }
+        // Default grouped view: Favorites → Recently Opened (editor order) → All
+        let favorites = items.filter(\.isFavorite)
+        let recently  = WorkspaceRecency.recentSection(
+            from: items.filter { !$0.isFavorite },
+            limit: WorkspaceRecency.recentSectionLimit
+        )
+        let recentPaths = Set(recently.map(\.path))
+        let rest      = items.filter { !$0.isFavorite && !recentPaths.contains($0.path) }
 
         var globalIdx = 0
 
@@ -155,8 +143,8 @@ struct CommandPaletteView: View {
         var filters: [WorkspaceFilter] = [.all]
 
         let all = appState.workspaces
-        if all.contains(where: { $0.isFavorite })       { filters.append(.favorites) }
-        if all.contains(where: { $0.lastOpened != nil }) { filters.append(.recent) }
+        if all.contains(where: \.isFavorite) { filters.append(.favorites) }
+        if all.contains(where: WorkspaceRecency.isRecentlyUsed) { filters.append(.recent) }
 
         for appType in AppType.allCases where appType != .unknown {
             if all.contains(where: { $0.appType == appType }) {
@@ -171,18 +159,7 @@ struct CommandPaletteView: View {
     }
 
     private func workspaceCount(for filter: WorkspaceFilter) -> Int {
-        switch filter {
-        case .all:
-            return appState.filteredWorkspaces.count
-        case .favorites:
-            return appState.filteredWorkspaces.filter(\.isFavorite).count
-        case .recent:
-            return appState.filteredWorkspaces.filter { $0.lastOpened != nil }.count
-        case .appType(let t):
-            return appState.filteredWorkspaces.filter { $0.appType == t }.count
-        case .projectType(let t):
-            return appState.filteredWorkspaces.filter { $0.projectType == t }.count
-        }
+        appState.applyFilter(filter, to: appState.filteredWorkspaces).count
     }
 
     // MARK: - Body
@@ -214,11 +191,25 @@ struct CommandPaletteView: View {
         .opacity(didAppear ? 1.0 : 0.0)
         .onAppear {
             withAnimation(.spring(response: 0.22, dampingFraction: 0.82)) { didAppear = true }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { searchFocused = true }
+            focusSearchField()
+        }
+        .onChange(of: appState.searchFocusGeneration) { _, _ in
+            focusSearchField()
         }
         .onDisappear {
-            didAppear      = false
-            searchFocused  = false
+            didAppear     = false
+            searchFocused = false
+        }
+    }
+
+    /// Focuses the search field so the user can type immediately.
+    private func focusSearchField() {
+        // Brief delay lets the panel finish becoming key before SwiftUI accepts focus.
+        DispatchQueue.main.async {
+            searchFocused = true
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            searchFocused = true
         }
     }
 
@@ -232,6 +223,11 @@ struct CommandPaletteView: View {
                         .progressViewStyle(.circular)
                         .scaleEffect(0.6)
                         .frame(width: 22, height: 22)
+                } else if appState.isSearching {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .scaleEffect(0.55)
+                        .frame(width: 22, height: 22)
                 } else {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 20, weight: .regular))
@@ -240,15 +236,14 @@ struct CommandPaletteView: View {
                 }
             }
             .animation(.easeInOut(duration: 0.15), value: appState.isLoading)
+            .animation(.easeInOut(duration: 0.15), value: appState.isSearching)
 
             TextField("Search workspaces…", text: $appState.searchText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 23, weight: .regular))
                 .foregroundColor(.primary)
                 .focused($searchFocused)
-                .onChange(of: appState.searchText) { _, _ in
-                    if activeFilter != .all { activeFilter = .all }
-                }
+                .focusable()
 
             Spacer(minLength: 8)
 
@@ -302,11 +297,11 @@ struct CommandPaletteView: View {
                 ForEach(availableFilters, id: \.self) { filter in
                     FilterTabButton(
                         filter: filter,
-                        isActive: activeFilter == filter,
+                        isActive: appState.activeFilter == filter,
                         matchCount: workspaceCount(for: filter)
                     ) {
                         withAnimation(.spring(response: 0.2, dampingFraction: 0.75)) {
-                            activeFilter = filter
+                            appState.activeFilter = filter
                         }
                     }
                 }
@@ -337,6 +332,14 @@ struct CommandPaletteView: View {
                                 appState.openWorkspace(ws)
                                 onDismiss()
                             },
+                            onRunAutomation: {
+                                appState.runWorkspaceAutomation(ws)
+                                onDismiss()
+                            },
+                            onEditAutomation: {
+                                appState.openAutomationEditor(for: ws)
+                                onDismiss()
+                            },
                             onOpenWith: { appType in
                                 var copy = ws; copy.appType = appType
                                 appState.openWorkspace(copy)
@@ -347,7 +350,9 @@ struct CommandPaletteView: View {
                                     [URL(fileURLWithPath: ws.path)]
                                 )
                             },
-                            onFavorite: { appState.toggleFavorite(ws) }
+                            onFavorite: { appState.toggleFavorite(ws) },
+                            automationStepCount: appState.automationStepCount(for: ws),
+                            isAutomationRunning: appState.automationRunState(for: ws).status == .running
                         )
                         .equatable()
                         .id(rowScrollID(for: idx))
@@ -396,9 +401,9 @@ struct CommandPaletteView: View {
                 .foregroundStyle(.tertiary)
                 .symbolRenderingMode(.hierarchical)
 
-            Text(appState.searchText.isEmpty
-                 ? "No workspaces found"
-                 : "No results for \"\(appState.searchText)\"")
+            Text(appState.isSearchActive
+                 ? "No results for \"\(appState.searchText.trimmingCharacters(in: .whitespacesAndNewlines))\""
+                 : "No workspaces found")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(.secondary)
         }
