@@ -116,7 +116,7 @@ final class AutomationEngine: ObservableObject {
         }
 
         tasks[workspace.path] = nil
-    } 
+    }
 
     // MARK: - Step Execution
 

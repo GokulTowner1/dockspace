@@ -51,8 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        // 5. Workspace list is loaded from disk cache in AppState.init.
-        // Discovery runs on first launcher open (refreshIfStale) to keep idle memory low.
+        // 5. Workspace list loads from cache in AppState.init; panel pre-warms after launch.
         if let welcomeManager {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                 welcomeManager.showIfNeeded()

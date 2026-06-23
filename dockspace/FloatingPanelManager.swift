@@ -18,10 +18,11 @@ final class FloatingPanel: NSPanel {
 
 private final class PanelWindowDelegate: NSObject, NSWindowDelegate {
     var onResignKey: (() -> Void)?
-    var onBecomeKey: (() -> Void)?
+    var onBecomeKey: ((NSWindow) -> Void)?
 
     func windowDidBecomeKey(_ notification: Notification) {
-        onBecomeKey?()
+        guard let window = notification.object as? NSWindow else { return }
+        onBecomeKey?(window)
     }
 
     func windowDidResignKey(_ notification: Notification) {
@@ -61,6 +62,20 @@ final class FloatingPanelManager {
         appState.hideLauncher   = { [weak self] in self?.hide() }
 
         log.info("FloatingPanelManager initialised, bridge closures registered in AppState")
+
+        // Pre-build the panel after launch so the first hotkey open is instant.
+        DispatchQueue.main.async { [weak self] in
+            self?.warmUp()
+        }
+    }
+
+    /// Builds the panel off-screen once so the first show skips view construction.
+    func warmUp() {
+        guard panel == nil else { return }
+        buildPanel()
+        panel?.orderOut(nil)
+        panel?.alphaValue = 1
+        log.info("warmUp() – panel pre-built")
     }
 
     // MARK: - Toggle
@@ -85,78 +100,52 @@ final class FloatingPanelManager {
         }
 
         if panel.isVisible {
-            log.info("show() – panel already visible, refocusing search")
             performShow(panel)
             return
         }
 
-        let delay: TimeInterval = fromMenuBar ? 0.12 : 0.0
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.performShow(panel)
+        // Minimal delay only when the menu bar must dismiss first.
+        if fromMenuBar {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.performShow(panel)
+            }
+        } else {
+            performShow(panel)
         }
     }
 
     private func performShow(_ panel: NSPanel) {
-        log.info("performShow() – centering and activating panel")
-
         centerPanel(panel)
         appState.resetSearch()
-        appState.prepareForActiveUse()
 
-        panel.alphaValue = 0
-
-        // Activate the app first, THEN make the panel key.
-        // Reversing this order can cause the panel to appear but not accept input.
         NSApp.activate(ignoringOtherApps: true)
-        panel.orderFrontRegardless()   // bring to front even if app isn't active yet
+        panel.alphaValue = 1
+        panel.orderFrontRegardless()
         panel.makeKeyAndOrderFront(nil)
 
-        log.info("Panel frame after show: \(String(describing: panel.frame))")
-
-        // Fade-in animation
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.20
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().alphaValue = 1
-        }
-
-        // Spring scale on the content layer
-        if let layer = panel.contentView?.layer {
-            let anim = CASpringAnimation(keyPath: "transform.scale")
-            anim.fromValue = 0.93
-            anim.toValue   = 1.0
-            anim.stiffness = 380
-            anim.damping   = 28
-            anim.mass      = 1
-            anim.duration  = anim.settlingDuration
-            layer.add(anim, forKey: "showScale")
-        } else {
-            log.warning("Content layer not available for spring animation")
-        }
-
         startMonitors()
-        focusSearchField(in: panel)
+        appState.requestSearchFieldFocus()
+        focusSearchField(in: panel, attempt: 0)
+        appState.prepareForActiveUse()
     }
 
-    /// Moves keyboard focus into the search field after the panel is key.
-    private func focusSearchField(in panel: NSPanel) {
-        appState.requestSearchFieldFocus()
+    /// SwiftUI focus + AppKit first responder, retried until the panel is key.
+    private func focusSearchField(in window: NSWindow, attempt: Int) {
+        guard window.isVisible, attempt < 6 else { return }
 
-        // First responder pass — helps AppKit wire focus before SwiftUI catches up.
-        DispatchQueue.main.async {
-            panel.makeKey()
-            if let hosting = panel.contentView {
-                panel.makeFirstResponder(hosting)
-            }
-            self.appState.requestSearchFieldFocus()
+        if !window.isKeyWindow {
+            window.makeKeyAndOrderFront(nil)
         }
 
-        // Fallback for slower window activation (menu bar, hotkey from background app).
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-            guard let self, let panel = self.panel, panel.isVisible else { return }
-            panel.makeKeyAndOrderFront(nil)
-            self.appState.requestSearchFieldFocus()
+        appState.requestSearchFieldFocus()
+
+        DispatchQueue.main.async { [weak self] in
+            let focused = SearchFieldFocusHelper.focus(in: window)
+            if !focused, attempt < 5 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                    self?.focusSearchField(in: window, attempt: attempt + 1)
+                }
+            }
         }
     }
 
@@ -167,14 +156,7 @@ final class FloatingPanelManager {
         log.info("hide() called")
         stopMonitors()
         appState.resetSearch()
-
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.14
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            panel.animator().alphaValue = 0
-        }, completionHandler: {
-            panel.orderOut(nil)
-        })
+        panel.orderOut(nil)
     }
 
     // MARK: - Panel Construction
@@ -182,11 +164,7 @@ final class FloatingPanelManager {
     private func buildPanel() {
         log.info("buildPanel() – constructing FloatingPanel")
 
-        let size = NSSize(width: 660, height: 700)
-        // Use FloatingPanel subclass which overrides canBecomeKey → true.
-        // A stock borderless NSPanel returns false from canBecomeKey, which
-        // means makeKeyAndOrderFront is a no-op and the text field never
-        // receives keyboard focus.
+        let size = NSSize(width: PaletteLayout.width, height: PaletteLayout.height)
         let panel = FloatingPanel(
             contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless],
@@ -202,17 +180,19 @@ final class FloatingPanelManager {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isExcludedFromWindowsMenu = true
         panel.hidesOnDeactivate = false
-        panel.appearance = nil   // follow system light / dark mode
-        // Default for NSPanel is becomesKeyOnlyIfNeeded = true (needs a focused control)
-        // Set to false so the panel always becomes key on orderFront
+        panel.appearance = nil
         panel.becomesKeyOnlyIfNeeded = false
+        panel.minSize = size
+        panel.maxSize = size
+        panel.contentMinSize = size
+        panel.contentMaxSize = size
 
         // Window delegate: auto-hide when panel loses key status (user clicked elsewhere)
         panelDelegate.onResignKey = { [weak self] in
             DispatchQueue.main.async { self?.hide() }
         }
-        panelDelegate.onBecomeKey = { [weak self] in
-            DispatchQueue.main.async { self?.appState.requestSearchFieldFocus() }
+        panelDelegate.onBecomeKey = { [weak self] window in
+            self?.focusSearchField(in: window, attempt: 0)
         }
         panel.delegate = panelDelegate
 
@@ -223,33 +203,46 @@ final class FloatingPanelManager {
         }).environmentObject(appState)
 
         let hosting = NSHostingView(rootView: rootView)
-        hosting.wantsLayer = true       // must set BEFORE accessing .layer
+        hosting.wantsLayer = true
         hosting.layer?.cornerRadius = 26
         hosting.layer?.masksToBounds = true
+        hosting.layer?.drawsAsynchronously = true
+        hosting.frame = NSRect(origin: .zero, size: size)
+        if #available(macOS 13.0, *) {
+            hosting.sizingOptions = []
+            hosting.safeAreaRegions = []
+        }
 
         panel.contentView = hosting
+        panel.setContentSize(size)
         self.panel = panel
 
         log.info("buildPanel() – done")
     }
 
-    // MARK: - Centering
+    private var cachedScreenID: CGDirectDisplayID?
+    private var cachedPanelOrigin: NSPoint?
 
     private func centerPanel(_ panel: NSPanel) {
-        // Always center on the main screen (where the menu bar lives),
-        // not based on mouse location, to avoid placing it near the menu bar.
         let screen = NSScreen.main ?? NSScreen.screens.first
-        guard let screen else {
-            log.warning("centerPanel() – no screen found")
+        guard let screen else { return }
+
+        let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+        let size = NSSize(width: PaletteLayout.width, height: PaletteLayout.height)
+
+        if displayID == cachedScreenID, let origin = cachedPanelOrigin, panel.frame.size == size {
+            panel.setFrameOrigin(origin)
             return
         }
+
         let sf = screen.visibleFrame
-        let pw = panel.frame.size.width
-        let ph = panel.frame.size.height
-        let x  = sf.midX - pw / 2
-        let y  = sf.midY - ph / 2 + sf.height * 0.08   // 12% space from the top
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
-        log.info("centerPanel() – origin set to (\(x), \(y)) on screen \(screen.localizedName)")
+        let origin = NSPoint(
+            x: sf.midX - size.width / 2,
+            y: sf.midY - size.height / 2 + sf.height * 0.08
+        )
+        panel.setFrame(NSRect(origin: origin, size: size), display: false)
+        cachedScreenID = displayID
+        cachedPanelOrigin = origin
     }
 
     // MARK: - Monitors

@@ -7,14 +7,20 @@ final class AppState: ObservableObject {
 
     // MARK: - Published State
 
-    @Published var workspaces: [Workspace]         = []
-    @Published var filteredWorkspaces: [Workspace] = []
+    @Published var workspaces: [Workspace] = []
     @Published var selectedIndex: Int = 0
     @Published var isLoading: Bool    = false
-    @Published var isSearching: Bool  = false
     @Published var automationsByWorkspacePath: [String: WorkspaceAutomation] = [:]
 
-    @Published var searchText: String = ""
+    @Published var searchText: String = "" {
+        didSet {
+            guard searchText != oldValue else { return }
+            selectedIndex = 0
+            if !normalizedSearchQuery.isEmpty, activeFilter != .all {
+                activeFilter = .all
+            }
+        }
+    }
 
     /// Incremented each time the launcher opens — drives search-field focus.
     @Published private(set) var searchFocusGeneration: Int = 0
@@ -55,11 +61,18 @@ final class AppState: ObservableObject {
     private var lastDiscoveryTime: Date = .distantPast
     private let discoveryMinInterval: TimeInterval = 120   // 2 minutes
 
-    // MARK: - Displayed List (single source of truth for UI + keyboard nav)
+    // MARK: - Live Search (computed — always in sync with searchText + workspaces)
+
+    /// Sorted list with live search applied. Recomputed whenever the view reads it.
+    var searchResults: [Workspace] {
+        let query = normalizedSearchQuery
+        guard !query.isEmpty else { return sortedWorkspaces(workspaces) }
+        return searchEngine.search(query: query, in: workspaces)
+    }
 
     /// Workspaces after search *and* the active filter tab — used by the palette and arrow keys.
     var displayedWorkspaces: [Workspace] {
-        applyFilter(activeFilter, to: filteredWorkspaces)
+        applyFilter(activeFilter, to: searchResults)
     }
 
     var isSearchActive: Bool {
@@ -73,9 +86,7 @@ final class AppState: ObservableObject {
     // MARK: - Init
 
     init() {
-        let cached = cacheEngine.loadWorkspaces().map(WorkspaceRecency.sanitizeCached)
-        workspaces         = cached
-        filteredWorkspaces = sortedWorkspaces(cached)
+        workspaces = cacheEngine.loadWorkspaces().map(WorkspaceRecency.sanitizeCached)
         automationStepCounts = automationStore.loadEnabledStepCounts()
 
         automationEngine.objectWillChange
@@ -85,23 +96,9 @@ final class AppState: ObservableObject {
             }
             .store(in: &cancellables)
 
-        bindSearchPipeline()
-        refreshEditorHistoryRanks()
-    }
-
-    private func bindSearchPipeline() {
-        $searchText
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .removeDuplicates()
-            .sink { [weak self] query in
-                guard let self else { return }
-                self.isSearching = !query.isEmpty
-                if !query.isEmpty, self.activeFilter != .all {
-                    self.activeFilter = .all
-                }
-                self.applySearch(query: query)
-            }
-            .store(in: &cancellables)
+        Task { @MainActor in
+            refreshEditorHistoryRanks()
+        }
     }
 
     // MARK: - Discovery
@@ -119,17 +116,19 @@ final class AppState: ObservableObject {
         let merged     = mergeWorkspaces(existing: workspaces, new: discovered)
         let valid      = merged.filter { $0.exists }
         workspaces = valid
-        performSearch()
         cacheEngine.saveWorkspaces(valid)
         isLoading = false
+        clampSelection()
     }
 
-    /// Called by FloatingPanelManager when the panel opens.
-    /// Starts background services and refreshes editor history order.
+    /// Called when the launcher panel becomes visible — heavy work is deferred.
     func prepareForActiveUse() {
         startFileWatcher()
-        refreshEditorHistoryRanks()
-        refreshIfStale()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.refreshEditorHistoryRanks()
+            self.refreshIfStale()
+        }
     }
 
     /// Lightweight refresh of editor recency ranks from Cursor / VS Code history.
@@ -149,8 +148,9 @@ final class AppState: ObservableObject {
         }
 
         if changed {
+            workspaces = workspaces
             cacheEngine.saveWorkspaces(workspaces)
-            performSearch()
+            clampSelection()
         }
     }
 
@@ -173,7 +173,6 @@ final class AppState: ObservableObject {
         automationStore.clearAll()
 
         workspaces = []
-        filteredWorkspaces = []
         automationsByWorkspacePath = [:]
         automationStepCounts = [:]
         automationsLoaded = false
@@ -185,18 +184,9 @@ final class AppState: ObservableObject {
 
     // MARK: - Search
 
+    /// Re-clamps keyboard selection after the workspace list changes.
     func performSearch() {
-        applySearch(query: normalizedSearchQuery)
-    }
-
-    private func applySearch(query: String) {
-        if query.isEmpty {
-            filteredWorkspaces = sortedWorkspaces(workspaces)
-        } else {
-            filteredWorkspaces = searchEngine.search(query: query, in: workspaces)
-        }
-        isSearching = false
-        selectedIndex = 0
+        clampSelection()
     }
 
     func applyFilter(_ filter: WorkspaceFilter, to base: [Workspace]) -> [Workspace] {
@@ -236,8 +226,7 @@ final class AppState: ObservableObject {
         if let idx = workspaces.firstIndex(where: { $0.path == workspace.path }) {
             workspaces[idx] = updated
         }
-        cacheEngine.saveWorkspaces(workspaces)
-        performSearch()
+        publishWorkspaces()
         launchEngine.open(workspace)
     }
 
@@ -250,8 +239,7 @@ final class AppState: ObservableObject {
         if let idx = workspaces.firstIndex(where: { $0.path == workspace.path }) {
             workspaces[idx] = updated
         }
-        cacheEngine.saveWorkspaces(workspaces)
-        performSearch()
+        publishWorkspaces()
 
         automationEngine.run(runnableAutomation(for: updated), for: updated)
     }
@@ -392,8 +380,8 @@ final class AppState: ObservableObject {
 
     func removeWorkspace(_ workspace: Workspace) {
         workspaces.removeAll { $0.path == workspace.path }
-        performSearch()
-        cacheEngine.saveWorkspaces(workspaces)
+        publishWorkspaces()
+        clampSelection()
     }
 
     // MARK: - Keyboard Navigation
@@ -424,10 +412,9 @@ final class AppState: ObservableObject {
     }
 
     func resetSearch() {
-        searchText    = ""
+        if !searchText.isEmpty { searchText = "" }
         activeFilter  = .all
         selectedIndex = 0
-        performSearch()
     }
 
     /// Called when the launcher panel becomes visible — focuses the search field.
@@ -454,8 +441,13 @@ final class AppState: ObservableObject {
         } else {
             workspaces.append(workspace)
         }
+        publishWorkspaces()
+    }
+
+    /// Persists workspaces and notifies SwiftUI after in-place mutations.
+    private func publishWorkspaces() {
+        workspaces = workspaces
         cacheEngine.saveWorkspaces(workspaces)
-        performSearch()
     }
 
     /// Merges freshly discovered workspaces with cached data using O(1) dict lookup.

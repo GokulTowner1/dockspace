@@ -10,25 +10,13 @@ struct WorkspaceRowView: View, Equatable {
     let workspace: Workspace
     let isSelected: Bool
     let onOpen: () -> Void
-    let onRunAutomation: () -> Void
-    let onEditAutomation: () -> Void
-    let onOpenWith: (AppType) -> Void
-    let onReveal: () -> Void
-    let onFavorite: () -> Void
-    let automationStepCount: Int
-    let isAutomationRunning: Bool
 
-    @State private var isHovered      = false
-    @State private var hoveredAction: String? = nil
+    @State private var isHovered = false
 
     private var isHighlighted: Bool { isHovered || isSelected }
-    private var showActions: Bool { isHighlighted }
 
     static func == (lhs: WorkspaceRowView, rhs: WorkspaceRowView) -> Bool {
-        lhs.workspace == rhs.workspace
-            && lhs.isSelected == rhs.isSelected
-            && lhs.automationStepCount == rhs.automationStepCount
-            && lhs.isAutomationRunning == rhs.isAutomationRunning
+        lhs.workspace == rhs.workspace && lhs.isSelected == rhs.isSelected
     }
 
     var body: some View {
@@ -75,16 +63,6 @@ struct WorkspaceRowView: View, Equatable {
                         .background(workspace.projectType.color.opacity(0.14))
                         .clipShape(Capsule())
                 }
-
-                if automationStepCount > 0 {
-                    Text("\(automationStepCount) steps")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.green.opacity(0.9))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1.5)
-                        .background(.green.opacity(0.13))
-                        .clipShape(Capsule())
-                }
             }
 
             Text(workspace.displayPath)
@@ -96,106 +74,45 @@ struct WorkspaceRowView: View, Equatable {
         .animation(RowMotion.highlight, value: isSelected)
     }
 
-    // MARK: - Right side (fixed width — prevents layout jumps while navigating)
+    // MARK: - Right side
 
     private var rightSide: some View {
         ZStack(alignment: .trailing) {
             if workspace.showsRecencyBadge {
-                if isAutomationRunning {
-                    HStack(spacing: 5) {
-                        ProgressView()
-                            .controlSize(.small)
-                            .scaleEffect(0.55)
-                        Text("Running")
-                            .font(.system(size: 11, weight: .medium))
-                    }
-                    .foregroundColor(.green.opacity(0.78))
-                    .opacity(showActions ? 0 : 1)
-                } else {
-                    Text(workspace.timeAgoString)
-                        .font(.system(size: 11, weight: .regular))
-                        .foregroundColor(.secondary.opacity(0.45))
-                        .opacity(showActions ? 0 : 1)
-                }
+                Text(workspace.timeAgoString)
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundColor(.secondary.opacity(0.45))
+                    .opacity(isHighlighted ? 0 : 1)
             }
 
-            quickActionBar
-                .opacity(showActions ? 1 : 0)
-                .allowsHitTesting(showActions)
+            openButton
+                .opacity(isHighlighted ? 1 : 0)
+                .allowsHitTesting(isHighlighted)
         }
-        .frame(width: 216, alignment: .trailing)
-        .animation(RowMotion.actions, value: showActions)
+        .frame(width: 88, alignment: .trailing)
+        .animation(RowMotion.actions, value: isHighlighted)
     }
 
-    // MARK: - Quick action bar
-
-    private var quickActionBar: some View {
-        HStack(spacing: 3) {
-            actionButton(id: "run", icon: "play.fill",
-                         label: "Run Workspace",
-                         color: .green) { onRunAutomation() }
-
-            actionButton(id: "automation", icon: "slider.horizontal.3",
-                         label: "Edit Automation",
-                         color: .orange) { onEditAutomation() }
-
-            Capsule()
-                .fill(Color.primary.opacity(0.10))
-                .frame(width: 1, height: 16)
-                .padding(.horizontal, 1)
-
-            actionButton(id: "cursor", icon: "cursorarrow.rays",
-                         label: "Open in Cursor",
-                         color: Color(red: 0.54, green: 0.36, blue: 0.97)) { onOpenWith(.cursor) }
-
-            actionButton(id: "vscode", icon: "chevron.left.forwardslash.chevron.right",
-                         label: "Open in VS Code",
-                         color: Color(red: 0.0, green: 0.47, blue: 0.83)) { onOpenWith(.vscode) }
-
-            actionButton(id: "finder", icon: "folder.fill",
-                         label: "Reveal in Finder",
-                         color: Color(red: 0.0, green: 0.48, blue: 1.0)) { onReveal() }
-
-            Capsule()
-                .fill(Color.primary.opacity(0.10))
-                .frame(width: 1, height: 16)
-                .padding(.horizontal, 1)
-
-            actionButton(id: "fav",
-                         icon: workspace.isFavorite ? "star.fill" : "star",
-                         label: workspace.isFavorite ? "Remove Favorite" : "Add Favorite",
-                         color: workspace.isFavorite ? .yellow : .secondary) { onFavorite() }
-        }
-    }
-
-    private func actionButton(
-        id: String, icon: String, label: String,
-        color: Color, action: @escaping () -> Void
-    ) -> some View {
-        let isThisHovered = hoveredAction == id
-        return Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(
-                    isThisHovered ? color : Color.secondary.opacity(0.60)
-                )
-                .frame(width: 26, height: 26)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(
-                            isThisHovered
-                                ? color.opacity(0.20)
-                                : Color.primary.opacity(0.06)
-                        )
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(isThisHovered ? color.opacity(0.32) : Color.clear, lineWidth: 0.5)
-                )
+    private var openButton: some View {
+        Button(action: onOpen) {
+            HStack(spacing: 5) {
+                Text("⏎")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("Open")
+                    .font(.system(size: 11.5, weight: .medium))
+            }
+            .foregroundColor(.secondary.opacity(0.85))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                Capsule().fill(Color.primary.opacity(0.08))
+            )
+            .overlay(
+                Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.5)
+            )
         }
         .buttonStyle(.plain)
-        .help(label)
-        .onHover { hoveredAction = $0 ? id : nil }
+        .help("Open workspace")
     }
 
     // MARK: - Row background

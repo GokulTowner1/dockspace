@@ -64,6 +64,7 @@ private enum SectionRow: Identifiable {
 // Shared motion — smooth curves keep keyboard scroll feeling native and cohesive.
 private enum PaletteMotion {
     static let scroll = Animation.smooth(duration: 0.22)
+    static let present = Animation.spring(response: 0.13, dampingFraction: 0.9)
     /// Keeps the focused row in the upper third — scrolls only as much as needed.
     static let scrollAnchor = UnitPoint(x: 0.5, y: 0.32)
 }
@@ -72,9 +73,14 @@ struct CommandPaletteView: View {
     @EnvironmentObject var appState: AppState
     let onDismiss: () -> Void
 
-    @FocusState private var searchFocused: Bool
-    @State private var didAppear       = false
+    @FocusState private var paletteFocus: PaletteFocus?
+    @Namespace private var focusNamespace
+    @State private var isPresented     = false
     @State private var scrollPosition: String?
+
+    private enum PaletteFocus: Hashable {
+        case search
+    }
 
     // MARK: - Pre-computed data
 
@@ -159,7 +165,7 @@ struct CommandPaletteView: View {
     }
 
     private func workspaceCount(for filter: WorkspaceFilter) -> Int {
-        appState.applyFilter(filter, to: appState.filteredWorkspaces).count
+        appState.applyFilter(filter, to: appState.searchResults).count
     }
 
     // MARK: - Body
@@ -177,39 +183,64 @@ struct CommandPaletteView: View {
 
             if rows.isEmpty {
                 emptyState
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 Divider()
                     .blendMode(.overlay)
                     .opacity(0.4)
                 resultsList
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(width: 660)
+        .focusScope(focusNamespace)
+        .defaultFocus($paletteFocus, .search)
+        .frame(width: PaletteLayout.width, height: PaletteLayout.height, alignment: .top)
+        .fixedSize(horizontal: true, vertical: true)
         .syncSystemColorScheme()
         .glassPanelStyle(cornerRadius: 26)
-        .scaleEffect(didAppear ? 1.0 : 0.96)
-        .opacity(didAppear ? 1.0 : 0.0)
+        .scaleEffect(isPresented ? 1 : 0.97)
+        .opacity(isPresented ? 1 : 0)
+        .animation(PaletteMotion.present, value: isPresented)
         .onAppear {
-            withAnimation(.spring(response: 0.22, dampingFraction: 0.82)) { didAppear = true }
+            isPresented = true
             focusSearchField()
         }
         .onChange(of: appState.searchFocusGeneration) { _, _ in
-            focusSearchField()
+            presentPalette()
+        }
+        .onChange(of: appState.searchText) { _, _ in
+            scrollPosition = rowScrollID(for: 0)
         }
         .onDisappear {
-            didAppear     = false
-            searchFocused = false
+            isPresented  = false
+            paletteFocus = nil
         }
     }
 
-    /// Focuses the search field so the user can type immediately.
-    private func focusSearchField() {
-        // Brief delay lets the panel finish becoming key before SwiftUI accepts focus.
-        DispatchQueue.main.async {
-            searchFocused = true
+    private func presentPalette() {
+        if !isPresented {
+            isPresented = true
+        } else {
+            isPresented = false
+            DispatchQueue.main.async { isPresented = true }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            searchFocused = true
+        focusSearchField()
+    }
+
+    /// Focuses the search field — SwiftUI focus state + AppKit first responder.
+    private func focusSearchField() {
+        paletteFocus = nil
+        DispatchQueue.main.async {
+            paletteFocus = .search
+            if let window = NSApp.keyWindow {
+                SearchFieldFocusHelper.focus(in: window)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+            paletteFocus = .search
+            if let window = NSApp.keyWindow {
+                SearchFieldFocusHelper.focus(in: window)
+            }
         }
     }
 
@@ -223,11 +254,6 @@ struct CommandPaletteView: View {
                         .progressViewStyle(.circular)
                         .scaleEffect(0.6)
                         .frame(width: 22, height: 22)
-                } else if appState.isSearching {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .scaleEffect(0.55)
-                        .frame(width: 22, height: 22)
                 } else {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 20, weight: .regular))
@@ -236,14 +262,18 @@ struct CommandPaletteView: View {
                 }
             }
             .animation(.easeInOut(duration: 0.15), value: appState.isLoading)
-            .animation(.easeInOut(duration: 0.15), value: appState.isSearching)
 
             TextField("Search workspaces…", text: $appState.searchText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 23, weight: .regular))
                 .foregroundColor(.primary)
-                .focused($searchFocused)
+                .focused($paletteFocus, equals: .search)
                 .focusable()
+                .onSubmit {
+                    if appState.openSelected() {
+                        onDismiss()
+                    }
+                }
 
             Spacer(minLength: 8)
 
@@ -331,28 +361,7 @@ struct CommandPaletteView: View {
                             onOpen: {
                                 appState.openWorkspace(ws)
                                 onDismiss()
-                            },
-                            onRunAutomation: {
-                                appState.runWorkspaceAutomation(ws)
-                                onDismiss()
-                            },
-                            onEditAutomation: {
-                                appState.openAutomationEditor(for: ws)
-                                onDismiss()
-                            },
-                            onOpenWith: { appType in
-                                var copy = ws; copy.appType = appType
-                                appState.openWorkspace(copy)
-                                onDismiss()
-                            },
-                            onReveal: {
-                                NSWorkspace.shared.activateFileViewerSelecting(
-                                    [URL(fileURLWithPath: ws.path)]
-                                )
-                            },
-                            onFavorite: { appState.toggleFavorite(ws) },
-                            automationStepCount: appState.automationStepCount(for: ws),
-                            isAutomationRunning: appState.automationRunState(for: ws).status == .running
+                            }
                         )
                         .equatable()
                         .id(rowScrollID(for: idx))
@@ -364,7 +373,8 @@ struct CommandPaletteView: View {
             .padding(.vertical, 8)
         }
         .scrollPosition(id: $scrollPosition, anchor: PaletteMotion.scrollAnchor)
-        .frame(maxHeight: 430)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .id(appState.searchText)
         .mask(
             VStack(spacing: 0) {
                 LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)

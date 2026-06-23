@@ -21,3 +21,12 @@ enum AppConstants {
         "\(marketingVersion) (\(buildNumber))"
     }
 }
+
+// MARK: - Launcher Panel Layout
+
+/// Fixed dimensions for the floating command palette — prevents NSHostingView from
+/// collapsing when the workspace list is short or empty.
+enum PaletteLayout {
+    static let width: CGFloat  = 660
+    static let height: CGFloat = 640
+}
