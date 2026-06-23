@@ -23,28 +23,27 @@ private func carbonHotkeyHandler(
 // MARK: - HotkeyEngine
 
 /// Registers a system-wide hotkey using Carbon's RegisterEventHotKey API.
-///
-/// **Why Carbon instead of NSEvent.addGlobalMonitorForEvents?**
-/// • NSEvent global monitors require the user to grant Accessibility permission
-///   (System Settings → Privacy & Security → Accessibility). Without it, the
-///   monitor is silently ignored while other apps are active.
-/// • Carbon RegisterEventHotKey works system-wide with **zero permissions**
-///   and is used by Spotlight, Alfred, Raycast, etc.
-///
-/// The only downside is it's a C API, but this class wraps it cleanly.
 final class HotkeyEngine {
 
     private var hotKeyRef: EventHotKeyRef?
     private var handlerRef: EventHandlerRef?
     private var localMonitor: Any?          // catches the shortcut when Dockspace is active
-    private(set) var currentCombo: KeyCombo = .default
+    private(set) var currentCombo: KeyCombo
+    private let signature: String
+    private let hotKeyId: UInt32
 
     var onTrigger: (() -> Void)?
+
+    init(combo: KeyCombo = .default, signature: String = "DKSP", id: UInt32 = 1) {
+        self.currentCombo = combo
+        self.signature = signature
+        self.hotKeyId = id
+    }
 
     // MARK: - Configure / Re-configure
 
     func configure(combo: KeyCombo) {
-        log.info("Configuring hotkey: \(combo.displayString)")
+        log.info("Configuring hotkey (\(self.signature)): \(combo.displayString)")
         currentCombo = combo
 
         // Unregister the old hotkey (but keep the handler installed)
@@ -63,14 +62,14 @@ final class HotkeyEngine {
         unregisterLocalMonitor()
         registerLocalMonitor(combo: combo)
 
-        log.info("Hotkey registered: \(combo.displayString)")
+        log.info("Hotkey registered (\(self.signature)): \(combo.displayString)")
     }
 
     func unregister() {
         unregisterHotKey()
         unregisterCarbonHandler()
         unregisterLocalMonitor()
-        log.info("Hotkey unregistered")
+        log.info("Hotkey unregistered (\(self.signature))")
     }
 
     deinit { unregister() }
@@ -78,7 +77,7 @@ final class HotkeyEngine {
     // MARK: - Trigger (called by Carbon callback)
 
     func fire() {
-        log.debug("Hotkey fired: \(self.currentCombo.displayString)")
+        log.debug("Hotkey fired (\(self.signature)): \(self.currentCombo.displayString)")
         onTrigger?()
     }
 
@@ -107,10 +106,10 @@ final class HotkeyEngine {
     }
 
     private func registerHotKey(combo: KeyCombo) {
-        // Signature "DKSP" identifies this hotkey to Carbon
+        // Signature identifies this hotkey to Carbon
         let hotKeyID = EventHotKeyID(
-            signature: fourCharCode("DKSP"),
-            id: 1
+            signature: fourCharCode(signature),
+            id: hotKeyId
         )
         let status = RegisterEventHotKey(
             combo.keyCode,

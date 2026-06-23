@@ -19,10 +19,37 @@ struct MenuBarMenuView: View {
             }
         }
         .help("Open the workspace launcher (\(appState.hotkeyCombo.displayString))")
-        // NOTE: Do NOT add a local keyboard shortcut here — it conflicts with
-        // the global Carbon hotkey registered in AppDelegate.
+
+        Button {
+            openSessionLauncher()
+        } label: {
+            Label {
+                Text("Open Session Launcher")
+            } icon: {
+                Image(systemName: "square.stack.3d.up.fill")
+            }
+        }
+        .help("Open the session launcher (\(appState.sessionHotkeyCombo.displayString))")
 
         Divider()
+
+        // Workspace Sessions Submenu
+        if !appState.sessions.isEmpty {
+            Menu {
+                ForEach(appState.sessions) { session in
+                    Button {
+                        log.info("Restoring session: \(session.name)")
+                        appState.restoreSession(session)
+                    } label: {
+                        Label(session.name, systemImage: session.preferredIDE.icon)
+                    }
+                }
+            } label: {
+                Label("Workspace Sessions", systemImage: "square.stack.3d.up.fill")
+            }
+
+            Divider()
+        }
 
         // Recent Workspaces
         if !appState.recentWorkspaces.isEmpty {
@@ -96,6 +123,20 @@ struct MenuBarMenuView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [appState] in
             log.info("openLauncher() – firing showLauncher closure")
             appState.showLauncher?()
+        }
+    }
+
+    private func openSessionLauncher() {
+        log.info("openSessionLauncher() called from menu bar button")
+
+        guard appState.showSessionLauncher != nil else {
+            log.error("openSessionLauncher() – AppState.showSessionLauncher is nil")
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [appState] in
+            log.info("openSessionLauncher() – firing showSessionLauncher closure")
+            appState.showSessionLauncher?()
         }
     }
 }

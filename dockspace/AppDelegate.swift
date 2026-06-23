@@ -9,9 +9,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     let appState    = AppState()
     var panelManager: FloatingPanelManager!
+    var sessionPanelManager: SessionPanelManager!
     var welcomeManager: WelcomeWindowManager?
     var automationWindowManager: AutomationWindowManager!
-    let hotkeyEngine = HotkeyEngine()
+    let hotkeyEngine = HotkeyEngine(signature: "DKSP", id: 1)
+    lazy var sessionHotkeyEngine = HotkeyEngine(combo: appState.sessionHotkeyCombo, signature: "DKSS", id: 2)
 
     private var cancellables = Set<AnyCancellable>()
 
@@ -25,8 +27,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Run as menu bar-only app — no Dock icon
         NSApp.setActivationPolicy(.accessory)
 
-        // 1. Build the floating panel manager (panel is created lazily on first show)
+        // 1. Build the floating panel managers (panels are created lazily on first show)
         panelManager = FloatingPanelManager(appState: appState)
+        sessionPanelManager = SessionPanelManager(appState: appState)
         automationWindowManager = AutomationWindowManager(appState: appState)
 
         // 2. First-run welcome (skipped entirely when onboarding is already complete)
@@ -38,8 +41,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             welcomeManager = welcome
         }
 
-        // 3. Wire the hotkey engine
+        // 3. Wire the hotkey engines
         setupHotkey()
+        setupSessionHotkey()
 
         // 4. Observe hotkey changes from Settings and re-register in real time
         appState.$hotkeyCombo
@@ -48,6 +52,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] newCombo in
                 log.info("Hotkey combo changed to \(newCombo.displayString) — re-registering")
                 self?.hotkeyEngine.configure(combo: newCombo)
+            }
+            .store(in: &cancellables)
+
+        appState.$sessionHotkeyCombo
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] newCombo in
+                log.info("Session hotkey combo changed to \(newCombo.displayString) — re-registering")
+                self?.sessionHotkeyEngine.configure(combo: newCombo)
             }
             .store(in: &cancellables)
 
@@ -71,13 +84,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         hotkeyEngine.unregister()
+        sessionHotkeyEngine.unregister()
     }
 
     // MARK: - Hotkey Setup
 
     private func setupHotkey() {
         let combo = appState.hotkeyCombo
-        log.info("Registering initial hotkey: \(combo.displayString)")
+        log.info("Registering initial workspace hotkey: \(combo.displayString)")
 
         // Carbon RegisterEventHotKey: works globally without Accessibility permission.
         // When triggered it calls appState.toggleLauncher (set by FloatingPanelManager).
@@ -85,5 +99,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.appState.toggleLauncher?()
         }
         hotkeyEngine.configure(combo: combo)
+    }
+
+    private func setupSessionHotkey() {
+        let combo = appState.sessionHotkeyCombo
+        log.info("Registering initial session hotkey: \(combo.displayString)")
+
+        sessionHotkeyEngine.onTrigger = { [weak self] in
+            self?.appState.toggleSessionLauncher?()
+        }
+        sessionHotkeyEngine.configure(combo: combo)
     }
 }

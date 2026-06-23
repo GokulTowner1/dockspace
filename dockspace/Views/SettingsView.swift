@@ -15,14 +15,26 @@ struct SettingsView: View {
     @State private var isResetting = false
     @State private var selectedTab = 0
 
+    // Session Management State inside Settings
+    @State private var editingSessionInSettings: WorkspaceSession? = nil
+    @State private var showingEditSheetInSettings = false
+
     var body: some View {
         TabView(selection: $selectedTab) {
             generalTab.tabItem { Label("General", systemImage: "gearshape") }.tag(0)
             workspacesTab.tabItem { Label("Workspaces", systemImage: "folder") }.tag(1)
-            aboutTab.tabItem { Label("About", systemImage: "info.circle") }.tag(2)
+            sessionsTab.tabItem { Label("Sessions", systemImage: "square.stack.3d.up.fill") }.tag(2)
+            aboutTab.tabItem { Label("About", systemImage: "info.circle") }.tag(3)
         }
-        .frame(width: 520, height: 420)
+        .frame(width: 560, height: 460)
         .onAppear { loadCustomPaths() }
+        .sheet(isPresented: $showingEditSheetInSettings) {
+            SessionEditView(session: editingSessionInSettings) {
+                showingEditSheetInSettings = false
+                editingSessionInSettings = nil
+            }
+            .environmentObject(appState)
+        }
     }
 
     // MARK: - General Tab
@@ -41,6 +53,7 @@ struct SettingsView: View {
                     ForEach(AppType.allCases.filter { $0 != .unknown }, id: \.rawValue) { type in
                         HStack {
                             Image(systemName: type.icon)
+                                .foregroundColor(type.accentColor)
                             Text(type.rawValue)
                         }
                         .tag(type.rawValue)
@@ -90,7 +103,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Clear Cache & Reset")
                         .font(.body)
-                    Text("Removes saved workspaces, favorites, open history, and automations. Dockspace will rescan your projects from Cursor / VS Code. Hotkey and preferences are kept.")
+                    Text("Removes saved workspaces, favorites, open history, automations, and sessions. Dockspace will rescan your projects from Cursor / VS Code. Hotkey and preferences are kept.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -126,7 +139,7 @@ struct SettingsView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This deletes cached workspaces, favorites, launch counts, and automations. Your projects will be discovered again from scratch.")
+            Text("This deletes cached workspaces, favorites, launch counts, automations, and sessions. Your projects will be discovered again from scratch.")
         }
     }
 
@@ -188,6 +201,92 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .padding([.horizontal, .bottom])
+            }
+        }
+    }
+
+    // MARK: - Sessions Tab
+
+    private var sessionsTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Global Session Shortcut")
+                        .font(.headline)
+                    Text("Summon the Workspace Session Manager palette.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                HotkeyRecorderButton(combo: $appState.sessionHotkeyCombo)
+            }
+            .padding(.horizontal)
+            .padding(.top)
+
+            Divider()
+                .padding(.horizontal)
+
+            HStack {
+                Text("Saved Sessions (\(appState.sessions.count))")
+                    .font(.headline)
+                Spacer()
+                Button("Create Session...") {
+                    editingSessionInSettings = nil
+                    showingEditSheetInSettings = true
+                }
+            }
+            .padding(.horizontal)
+
+            if appState.sessions.isEmpty {
+                ContentUnavailableView(
+                    "No Saved Sessions",
+                    systemImage: "square.stack.3d.up.badge.a",
+                    description: Text("Create a session manually or use ⌥⌘S to capture your workspace.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach(appState.sessions) { session in
+                        HStack {
+                            Image(systemName: session.preferredIDE.icon)
+                                .foregroundColor(session.preferredIDE.accentColor)
+                                .frame(width: 24, height: 24)
+                            
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(session.name)
+                                    .font(.system(size: 13, weight: .bold))
+                                Text(session.displayPath)
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            
+                            Spacer()
+                            
+                            HStack(spacing: 12) {
+                                Button("Edit") {
+                                    editingSessionInSettings = session
+                                    showingEditSheetInSettings = true
+                                }
+                                .buttonStyle(.borderless)
+
+                                Button("Duplicate") {
+                                    appState.duplicateSession(session)
+                                }
+                                .buttonStyle(.borderless)
+
+                                Button(role: .destructive) {
+                                    appState.deleteSession(session)
+                                } label: {
+                                    Text("Delete")
+                                        .foregroundColor(.red)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                }
             }
         }
     }

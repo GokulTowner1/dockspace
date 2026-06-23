@@ -1,6 +1,8 @@
 import Foundation
 import Combine
 import AppKit
+import Carbon.HIToolbox
+import os.log
 
 @MainActor
 final class AppState: ObservableObject {
@@ -29,10 +31,27 @@ final class AppState: ObservableObject {
         didSet { clampSelection() }
     }
 
-    // MARK: - Hotkey Combo (persisted, drives real-time re-registration)
+    // MARK: - Workspace Hotkey Combo (persisted, drives real-time re-registration)
 
     @Published var hotkeyCombo: KeyCombo = .loadFromDefaults() {
         didSet { hotkeyCombo.saveToDefaults() }
+    }
+
+    // MARK: - Session Published State
+
+    @Published var sessions: [WorkspaceSession] = []
+    @Published var sessionSelectedIndex: Int = 0
+    @Published var isRestoringSession: Bool = false
+    @Published var restoringSessionName: String = ""
+    @Published var sessionSearchText: String = "" {
+        didSet {
+            guard sessionSearchText != oldValue else { return }
+            sessionSelectedIndex = 0
+        }
+    }
+
+    @Published var sessionHotkeyCombo: KeyCombo = AppState.loadSessionHotkeyFromDefaults() {
+        didSet { AppState.saveSessionHotkeyToDefaults(sessionHotkeyCombo) }
     }
 
     // MARK: - Panel Bridge
@@ -41,6 +60,13 @@ final class AppState: ObservableObject {
     var toggleLauncher: (() -> Void)?
     var hideLauncher: (() -> Void)?
     var showAutomation: ((Workspace) -> Void)?
+
+    // Session Launcher closures
+    var showSessionLauncher: (() -> Void)?
+    var toggleSessionLauncher: (() -> Void)?
+    var hideSessionLauncher: (() -> Void)?
+    var showSessionEditor: ((WorkspaceSession) -> Void)?
+    var showSessionCreator: (() -> Void)?
 
     // MARK: - Engines
 
@@ -55,6 +81,10 @@ final class AppState: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var automationsLoaded = false
     private var automationStepCounts: [String: Int] = [:]
+
+    // Session-specific Engines
+    private let sessionDatabase = SessionDatabase()
+    private let sessionRestoreEngine = SessionRestoreEngine()
 
     /// Guards against running discovery more frequently than this interval.
     /// 0% CPU when idle — discovery only runs at launch + on panel-open if stale.
@@ -83,6 +113,16 @@ final class AppState: ObservableObject {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // MARK: - Session Computed Search Results
+
+    var displayedSessions: [WorkspaceSession] {
+        let query = sessionSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty {
+            return sessions
+        }
+        return sessions.filter { $0.name.localizedCaseInsensitiveContains(query) || $0.projectPath.localizedCaseInsensitiveContains(query) }
+    }
+
     // MARK: - Init
 
     init() {
@@ -95,6 +135,9 @@ final class AppState: ObservableObject {
                 self?.objectWillChange.send()
             }
             .store(in: &cancellables)
+
+        // Load sessions from SQLite database
+        sessions = sessionDatabase.loadSessions()
 
         Task { @MainActor in
             refreshEditorHistoryRanks()
@@ -171,8 +214,10 @@ final class AppState: ObservableObject {
     func resetAllApplicationData() async {
         cacheEngine.clearAllData()
         automationStore.clearAll()
+        sessionDatabase.clearAll()
 
         workspaces = []
+        sessions = []
         automationsByWorkspacePath = [:]
         automationStepCounts = [:]
         automationsLoaded = false
@@ -199,77 +244,55 @@ final class AppState: ObservableObject {
             return WorkspaceRecency.recent(from: base)
         case .appType(let t):
             return base.filter { $0.appType == t }
-        case .projectType(let t):
-            return base.filter { $0.projectType == t }
-        }
-    }
-
-    private func clampSelection() {
-        let count = displayedWorkspaces.count
-        guard count > 0 else {
-            selectedIndex = 0
-            return
-        }
-        if selectedIndex >= count {
-            selectedIndex = count - 1
+        case .projectType(let pt):
+            return base.filter { $0.projectType == pt }
         }
     }
 
     // MARK: - Workspace Actions
 
-    func openWorkspace(_ workspace: Workspace) {
+    /// Opens the currently highlighted workspace and hides the launcher panel.
+    func openSelected() -> Bool {
+        let items = displayedWorkspaces
+        guard selectedIndex < items.count else { return false }
+        openWorkspace(items[selectedIndex])
+        return true
+    }
+
+    func toggleFavorite(_ workspace: Workspace) {
         var updated = workspace
-        updated.launchCount += 1
-        updated.lastOpened = Date()
-        updated.editorRecencyRank = 0
-        WorkspaceRecency.bumpToTop(path: workspace.path, in: &workspaces)
-        if let idx = workspaces.firstIndex(where: { $0.path == workspace.path }) {
-            workspaces[idx] = updated
-        }
+        updated.isFavorite.toggle()
+        updateWorkspace(updated)
+    }
+
+    func removeWorkspace(_ workspace: Workspace) {
+        workspaces.removeAll { $0.path == workspace.path }
         publishWorkspaces()
-        launchEngine.open(workspace)
+        clampSelection()
     }
 
-    func runWorkspaceAutomation(_ workspace: Workspace) {
-        var updated = workspace
-        updated.launchCount += 1
-        updated.lastOpened = Date()
-        updated.editorRecencyRank = 0
-        WorkspaceRecency.bumpToTop(path: workspace.path, in: &workspaces)
-        if let idx = workspaces.firstIndex(where: { $0.path == workspace.path }) {
-            workspaces[idx] = updated
+    // MARK: - Recording Actions
+
+    func startAutomationRecording(for workspace: Workspace) {
+        automationRecorder.startRecording(for: workspace)
+    }
+
+    @discardableResult
+    func stopAutomationRecording(for workspace: Workspace) -> Int {
+        let captured = automationRecorder.stopRecording()
+        guard !captured.isEmpty else { return 0 }
+
+        updateAutomation(for: workspace) { automation in
+            automation.steps.append(contentsOf: captured)
         }
-        publishWorkspaces()
-
-        automationEngine.run(runnableAutomation(for: updated), for: updated)
+        return captured.count
     }
 
-    func openAutomationEditor(for workspace: Workspace) {
-        showAutomation?(workspace)
+    func discardAutomationRecording() {
+        automationRecorder.discardRecording()
     }
 
-    func automation(for workspace: Workspace) -> WorkspaceAutomation {
-        ensureAutomationsLoaded()
-        return automationsByWorkspacePath[workspace.path] ?? .starter(for: workspace)
-    }
-
-    func savedAutomation(for workspace: Workspace) -> WorkspaceAutomation? {
-        ensureAutomationsLoaded()
-        return automationsByWorkspacePath[workspace.path]
-    }
-
-    func runnableAutomation(for workspace: Workspace) -> WorkspaceAutomation {
-        ensureAutomationsLoaded()
-        return automationsByWorkspacePath[workspace.path] ?? .starter(for: workspace)
-    }
-
-    func automationRunState(for workspace: Workspace) -> AutomationRunState {
-        automationEngine.runsByWorkspacePath[workspace.path] ?? .idle(for: workspace.path)
-    }
-
-    func automationStepCount(for workspace: Workspace) -> Int {
-        automationStepCounts[workspace.path] ?? 0
-    }
+    // MARK: - Automation Management
 
     func saveAutomation(_ automation: WorkspaceAutomation) {
         ensureAutomationsLoaded()
@@ -337,25 +360,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    func startAutomationRecording(for workspace: Workspace) {
-        automationRecorder.startRecording(for: workspace)
-    }
-
-    @discardableResult
-    func stopAutomationRecording(for workspace: Workspace) -> Int {
-        let captured = automationRecorder.stopRecording()
-        guard !captured.isEmpty else { return 0 }
-
-        updateAutomation(for: workspace) { automation in
-            automation.steps.append(contentsOf: captured)
-        }
-        return captured.count
-    }
-
-    func discardAutomationRecording() {
-        automationRecorder.discardRecording()
-    }
-
     func captureFrontmostWindowLayout(for workspace: Workspace) throws {
         let wasRecording = automationRecorder.isRecording
         let previousCount = automationRecorder.capturedSteps.count
@@ -372,19 +376,59 @@ final class AppState: ObservableObject {
         }
     }
 
-    func toggleFavorite(_ workspace: Workspace) {
+    func runWorkspaceAutomation(_ workspace: Workspace) {
+        let current = runnableAutomation(for: workspace)
+        automationEngine.run(current, for: workspace)
+    }
+
+    // MARK: - Open Workspace Flow
+
+    func openWorkspace(_ workspace: Workspace) {
         var updated = workspace
-        updated.isFavorite.toggle()
-        updateWorkspace(updated)
-    }
+        let runnable = runnableAutomation(for: workspace)
 
-    func removeWorkspace(_ workspace: Workspace) {
-        workspaces.removeAll { $0.path == workspace.path }
+        // Optimisation: update recency in AppState immediately to trigger
+        // UI reactive updates before the launch filesystem cycle completes.
+        updated.launchCount += 1
+        updated.lastOpened = Date()
+        updated.editorRecencyRank = 0
+        WorkspaceRecency.bumpToTop(path: workspace.path, in: &workspaces)
+        if let idx = workspaces.firstIndex(where: { $0.path == workspace.path }) {
+            workspaces[idx] = updated
+        }
         publishWorkspaces()
-        clampSelection()
+
+        automationEngine.run(runnable, for: updated)
     }
 
-    // MARK: - Keyboard Navigation
+    func openAutomationEditor(for workspace: Workspace) {
+        showAutomation?(workspace)
+    }
+
+    func automation(for workspace: Workspace) -> WorkspaceAutomation {
+        ensureAutomationsLoaded()
+        return automationsByWorkspacePath[workspace.path] ?? .starter(for: workspace)
+    }
+
+    func savedAutomation(for workspace: Workspace) -> WorkspaceAutomation? {
+        ensureAutomationsLoaded()
+        return automationsByWorkspacePath[workspace.path]
+    }
+
+    func runnableAutomation(for workspace: Workspace) -> WorkspaceAutomation {
+        ensureAutomationsLoaded()
+        return automationsByWorkspacePath[workspace.path] ?? .starter(for: workspace)
+    }
+
+    func automationRunState(for workspace: Workspace) -> AutomationRunState {
+        automationEngine.runsByWorkspacePath[workspace.path] ?? .idle(for: workspace.path)
+    }
+
+    func automationStepCount(for workspace: Workspace) -> Int {
+        automationStepCounts[workspace.path] ?? (workspaces.contains(where: { $0.path == workspace.path }) ? 1 : 0)
+    }
+
+    // MARK: - Keyboard Navigation (Workspaces)
 
     func moveSelectionUp() {
         let items = displayedWorkspaces
@@ -398,11 +442,13 @@ final class AppState: ObservableObject {
         selectedIndex = (selectedIndex + 1) % items.count
     }
 
-    func openSelected() -> Bool {
-        let items = displayedWorkspaces
-        guard selectedIndex < items.count else { return false }
-        openWorkspace(items[selectedIndex])
-        return true
+    private func clampSelection() {
+        let count = displayedWorkspaces.count
+        if count == 0 {
+            selectedIndex = 0
+        } else if selectedIndex >= count {
+            selectedIndex = count - 1
+        }
     }
 
     var selectedWorkspace: Workspace? {
@@ -420,6 +466,356 @@ final class AppState: ObservableObject {
     /// Called when the launcher panel becomes visible — focuses the search field.
     func requestSearchFieldFocus() {
         searchFocusGeneration += 1
+    }
+
+    // MARK: - Session Management CRUD
+
+    func saveSession(_ session: WorkspaceSession) {
+        sessionDatabase.saveSession(session)
+        sessions = sessionDatabase.loadSessions()
+    }
+
+    func deleteSession(_ session: WorkspaceSession) {
+        sessionDatabase.deleteSession(id: session.id)
+        sessions = sessionDatabase.loadSessions()
+        clampSessionSelection()
+    }
+
+    func duplicateSession(_ session: WorkspaceSession) {
+        var copy = session
+        copy.id = UUID()
+        copy.name = "Copy of \(session.name)"
+        copy.createdAt = Date()
+        copy.updatedAt = Date()
+        saveSession(copy)
+    }
+
+    func restoreSession(_ session: WorkspaceSession) {
+        guard !isRestoringSession else { return }
+        isRestoringSession = true
+        restoringSessionName = session.name
+        
+        Task {
+            do {
+                try await sessionRestoreEngine.restore(session)
+            } catch {
+                let log = Logger(subsystem: "com.dockspace.app", category: "AppState")
+                log.error("Failed to restore session '\(session.name)': \(error.localizedDescription)")
+            }
+            
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            isRestoringSession = false
+            restoringSessionName = ""
+        }
+    }
+
+    func openSelectedSession() -> Bool {
+        let list = displayedSessions
+        guard sessionSelectedIndex < list.count else { return false }
+        restoreSession(list[sessionSelectedIndex])
+        return true
+    }
+
+    // MARK: - Keyboard Navigation (Sessions)
+
+    func moveSessionSelectionUp() {
+        let maxIdx = displayedSessions.count - 1
+        guard maxIdx >= 0 else { return }
+        sessionSelectedIndex = (sessionSelectedIndex == 0) ? maxIdx : sessionSelectedIndex - 1
+    }
+
+    func moveSessionSelectionDown() {
+        let maxIdx = displayedSessions.count - 1
+        guard maxIdx >= 0 else { return }
+        sessionSelectedIndex = (sessionSelectedIndex == maxIdx) ? 0 : sessionSelectedIndex + 1
+    }
+
+    private func clampSessionSelection() {
+        let count = displayedSessions.count
+        if count == 0 {
+            sessionSelectedIndex = 0
+        } else if sessionSelectedIndex >= count {
+            sessionSelectedIndex = count - 1
+        }
+    }
+
+    func highlightedSession() -> WorkspaceSession? {
+        let items = displayedSessions
+        guard sessionSelectedIndex < items.count else { return nil }
+        return items[sessionSelectedIndex]
+    }
+
+    func resetSessionSearch() {
+        if !sessionSearchText.isEmpty { sessionSearchText = "" }
+        sessionSelectedIndex = 0
+    }
+
+    // MARK: - Session Capture State Implementation
+
+    func captureCurrentSessionState(name: String) async -> WorkspaceSession? {
+        let runningApps = NSWorkspace.shared.runningApplications
+        let hasVscode = runningApps.contains { ($0.localizedName ?? "").localizedCaseInsensitiveContains("Code") }
+        let hasCursor = runningApps.contains { ($0.localizedName ?? "").localizedCaseInsensitiveContains("Cursor") }
+        let ide: AppType = hasCursor ? .cursor : (hasVscode ? .vscode : .cursor)
+        
+        var projectPath = ""
+        if let firstWorkspace = workspaces.first {
+            projectPath = firstWorkspace.path
+        }
+        
+        let appleScriptIDE = """
+        tell application "System Events"
+            set ideName to ""
+            if exists process "Cursor" then
+                set ideName to "Cursor"
+            else if exists process "Visual Studio Code" then
+                set ideName to "Visual Studio Code"
+            end if
+            if ideName is not "" then
+                tell process ideName
+                    if (count of windows) > 0 then
+                        return name of window 1
+                    end if
+                end tell
+            end if
+        end tell
+        return ""
+        """
+        
+        if let windowTitle = runAppleScript(appleScriptIDE), !windowTitle.isEmpty {
+            if let matched = workspaces.first(where: { workspace in
+                windowTitle.localizedCaseInsensitiveContains(workspace.name)
+            }) {
+                projectPath = matched.path
+            }
+        }
+        
+        // Capture Browser URLs
+        var browserURLs: [BrowserURL] = []
+        for browser in ["Google Chrome", "Safari", "Arc"] {
+            if runningApps.contains(where: { ($0.localizedName ?? "") == browser }) {
+                let script: String
+                if browser == "Safari" {
+                    script = """
+                    tell application "Safari"
+                        set urlList to {}
+                        repeat with w in windows
+                            repeat with t in tabs of w
+                                copy URL of t to end of urlList
+                            end repeat
+                        end repeat
+                        return urlList
+                    end tell
+                    """
+                } else {
+                    script = """
+                    tell application "\(browser)"
+                        set urlList to {}
+                        try
+                            repeat with w in windows
+                                repeat with t in tabs of w
+                                    copy URL of t to end of urlList
+                                end repeat
+                            end repeat
+                        end try
+                        return urlList
+                    end tell
+                    """
+                }
+                
+                if let rawURLs = runAppleScript(script) {
+                    let urls = rawURLs.components(separatedBy: ", ")
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty && $0 != "missing value" }
+                    for url in urls {
+                        if !browserURLs.contains(where: { $0.urlString == url }) {
+                            browserURLs.append(BrowserURL(urlString: url, browserName: browser))
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Capture Terminal Tabs
+        var terminalTabs: [TerminalTab] = []
+        if runningApps.contains(where: { ($0.localizedName ?? "") == "Terminal" }) {
+            let script = """
+            tell application "Terminal"
+                set ttyList to {}
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        copy tty of t to end of ttyList
+                    end repeat
+                end repeat
+                return ttyList
+            end tell
+            """
+            if let rawTTYs = runAppleScript(script) {
+                let ttys = rawTTYs.components(separatedBy: ", ").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                for (idx, tty) in ttys.enumerated() {
+                    let cleanTty = tty.hasPrefix("/dev/") ? tty : "/dev/\(tty)"
+                    if let cwd = getCWDForTTY(cleanTty) {
+                        terminalTabs.append(TerminalTab(
+                            tabTitle: "Terminal Tab",
+                            workingDirectory: cwd,
+                            command: nil,
+                            tabIndex: idx
+                        ))
+                    }
+                }
+            }
+        }
+        
+        // Capture Window Positions
+        var windowPositions: [WindowPosition] = []
+        let captureApps = ["Google Chrome", "Safari", "Arc", "Terminal", "iTerm", "iTerm2", "Cursor", "Visual Studio Code"]
+        for appName in captureApps {
+            if let app = runningApps.first(where: { ($0.localizedName ?? "") == appName }) {
+                let appElement = AXUIElementCreateApplication(app.processIdentifier)
+                var windowsValue: CFTypeRef?
+                if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsValue) == .success,
+                   let windows = windowsValue as? [AXUIElement] {
+                    for win in windows {
+                        var positionValue: CFTypeRef?
+                        var sizeValue: CFTypeRef?
+                        var titleValue: CFTypeRef?
+                        
+                        if AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &positionValue) == .success,
+                           AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeValue) == .success {
+                            var point = CGPoint.zero
+                            var size = CGSize.zero
+                            AXValueGetValue(positionValue as! AXValue, .cgPoint, &point)
+                            AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+                            
+                            var title = ""
+                            if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleValue) == .success {
+                                title = titleValue as? String ?? ""
+                            }
+                            
+                            windowPositions.append(WindowPosition(
+                                appName: appName,
+                                bundleID: app.bundleIdentifier,
+                                windowTitle: title.isEmpty ? nil : title,
+                                x: Double(point.x),
+                                y: Double(point.y),
+                                width: Double(size.width),
+                                height: Double(size.height),
+                                mode: "custom"
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+        
+        return WorkspaceSession(
+            name: name,
+            projectPath: projectPath,
+            preferredIDE: ide,
+            terminalTabs: terminalTabs,
+            browserURLs: browserURLs,
+            windowPositions: windowPositions
+        )
+    }
+
+    private func getCWDForTTY(_ tty: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-t", tty, "-o", "pid=,stat=,comm="]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let output = String(data: data, encoding: .utf8) else { return nil }
+
+            let lines = output.components(separatedBy: .newlines)
+            for line in lines {
+                let parts = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .components(separatedBy: .whitespaces)
+                    .filter { !$0.isEmpty }
+                guard parts.count >= 3 else { continue }
+                let pid = parts[0]
+                let comm = parts[2]
+                if comm.contains("zsh") || comm.contains("bash") || comm.contains("sh") {
+                    if let cwd = getCWDForPID(pid) {
+                        return cwd
+                    }
+                }
+            }
+        } catch {
+            return nil
+        }
+        return nil
+    }
+
+    private func getCWDForPID(_ pid: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-p", pid, "-a", "-d", "cwd", "-Fn"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let output = String(data: data, encoding: .utf8) else { return nil }
+
+            let lines = output.components(separatedBy: .newlines)
+            for line in lines {
+                if line.hasPrefix("n") {
+                    let path = String(line.dropFirst())
+                    if FileManager.default.fileExists(atPath: path) {
+                        return path
+                    }
+                }
+            }
+        } catch {
+            return nil
+        }
+        return nil
+    }
+
+    private func runAppleScript(_ source: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", source]
+        process.standardError = Pipe()
+        let output = Pipe()
+        process.standardOutput = output
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            return nil
+        }
+    }
+
+    // MARK: - Session Hotkey Defaults
+
+    private static let sessionKeyCodeKey = "dockspace.sessionHotkey.keyCode"
+    private static let sessionModifiersKey = "dockspace.sessionHotkey.modifiers"
+
+    private static func loadSessionHotkeyFromDefaults() -> KeyCombo {
+        let code = UserDefaults.standard.integer(forKey: sessionKeyCodeKey)
+        let mods = UserDefaults.standard.integer(forKey: sessionModifiersKey)
+        guard code > 0 else {
+            // Default Session Hotkey: ⌥⌘S (Option + Command + S)
+            return KeyCombo(keyCode: UInt32(kVK_ANSI_S), carbonModifiers: UInt32(cmdKey | optionKey))
+        }
+        return KeyCombo(keyCode: UInt32(code), carbonModifiers: UInt32(mods))
+    }
+
+    private static func saveSessionHotkeyToDefaults(_ combo: KeyCombo) {
+        UserDefaults.standard.set(Int(combo.keyCode), forKey: sessionKeyCodeKey)
+        UserDefaults.standard.set(Int(combo.carbonModifiers), forKey: sessionModifiersKey)
     }
 
     // MARK: - Computed Subsets (used by the UI)
@@ -451,13 +847,6 @@ final class AppState: ObservableObject {
     }
 
     /// Merges freshly discovered workspaces with cached data using O(1) dict lookup.
-    ///
-    /// Merge rules for each discovered workspace:
-    /// - If it already exists in the cache:
-    ///   • Keep user `lastOpened` / `launchCount` / `isFavorite`
-    ///   • Merge `editorRecencyRank` (lower = more recent)
-    ///   • Keep cached `projectType` detection in sync on refresh
-    /// - If it is new: use the discovered data as-is.
     private func mergeWorkspaces(existing: [Workspace], new: [Workspace]) -> [Workspace] {
         // Build O(1) lookup
         var cached = [String: Workspace](minimumCapacity: existing.count)
