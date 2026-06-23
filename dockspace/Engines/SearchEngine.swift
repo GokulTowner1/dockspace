@@ -33,7 +33,6 @@ struct SearchEngine {
         let pathSegments = meaningfulPathSegments(for: workspace.path)
         let appType = workspace.appType.rawValue.lowercased()
         let tags = workspace.tags.map { $0.lowercased() }
-        let displayPath = workspace.displayPath.lowercased()
         let branch = workspace.gitInfo?.branch.lowercased()
 
         // Every token must match at least one searchable field.
@@ -46,7 +45,6 @@ struct SearchEngine {
                 pathSegments: pathSegments,
                 appType: appType,
                 tags: tags,
-                displayPath: displayPath,
                 branch: branch
             )
             guard tokenScore > 0 else { return 0 }
@@ -75,7 +73,6 @@ struct SearchEngine {
         pathSegments: [String],
         appType: String,
         tags: [String],
-        displayPath: String,
         branch: String?
     ) -> Double {
         var best: Double = 0

@@ -2,9 +2,13 @@ import Foundation
 
 struct CacheEngine {
 
-    private var cacheURL: URL {
+    var dockspaceDirectory: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("Dockspace", isDirectory: true)
+        return appSupport.appendingPathComponent("Dockspace", isDirectory: true)
+    }
+
+    private var cacheURL: URL {
+        let dir = dockspaceDirectory
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("workspaces.json")
     }
@@ -26,5 +30,17 @@ struct CacheEngine {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(workspaces) else { return }
         try? data.write(to: cacheURL, options: .atomic)
+    }
+
+    // MARK: - Reset
+
+    /// Removes all cached workspace data.
+    func clearWorkspaces() {
+        try? FileManager.default.removeItem(at: cacheURL)
+    }
+
+    /// Deletes the entire Dockspace Application Support folder.
+    func clearAllData() {
+        try? FileManager.default.removeItem(at: dockspaceDirectory)
     }
 }

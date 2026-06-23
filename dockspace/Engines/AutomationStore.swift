@@ -62,4 +62,8 @@ struct AutomationStore {
             log.error("Failed to save automations: \(error.localizedDescription)")
         }
     }
+
+    func clearAll() {
+        try? FileManager.default.removeItem(at: storeURL)
+    }
 }

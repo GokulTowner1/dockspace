@@ -11,6 +11,8 @@ struct SettingsView: View {
 
     @State private var customPaths: [String] = []
     @State private var showingPathPicker = false
+    @State private var showingResetConfirmation = false
+    @State private var isResetting = false
     @State private var selectedTab = 0
 
     var body: some View {
@@ -83,9 +85,49 @@ struct SettingsView: View {
                 .foregroundColor(.secondary)
                 .buttonStyle(.plain)
             }
+
+            Section("Data") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Clear Cache & Reset")
+                        .font(.body)
+                    Text("Removes saved workspaces, favorites, open history, and automations. Dockspace will rescan your projects from Cursor / VS Code. Hotkey and preferences are kept.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Button(role: .destructive) {
+                    showingResetConfirmation = true
+                } label: {
+                    HStack {
+                        if isResetting {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(isResetting ? "Resetting…" : "Reset All Data")
+                    }
+                }
+                .disabled(isResetting)
+            }
         }
         .formStyle(.grouped)
         .padding()
+        .confirmationDialog(
+            "Reset all Dockspace data?",
+            isPresented: $showingResetConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Reset Everything", role: .destructive) {
+                isResetting = true
+                Task {
+                    await appState.resetAllApplicationData()
+                    isResetting = false
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This deletes cached workspaces, favorites, launch counts, and automations. Your projects will be discovered again from scratch.")
+        }
     }
 
     // MARK: - Workspaces Tab

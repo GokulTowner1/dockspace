@@ -11,6 +11,21 @@ import Foundation
 
 struct dockspaceTests {
 
+    @Test func searchDoesNotMatchDocumentsPathSegment() async throws {
+        let engine = SearchEngine()
+        let workspaces = [
+            Workspace(name: "dockspace", path: "/Users/dev/Documents/swiftui/dockspace", projectType: .swift),
+            Workspace(name: "distributor", path: "/Users/dev/Documents/Towner/distributor"),
+            Workspace(name: "ranger", path: "/Users/dev/Documents/Synamic/ranger", projectType: .flutter),
+        ]
+
+        let results = engine.search(query: "di", in: workspaces)
+        let names = Set(results.map(\.name))
+        #expect(names.contains("distributor"))
+        #expect(!names.contains("dockspace"))
+        #expect(!names.contains("ranger"))
+    }
+
     @Test func searchMatchesWorkspaceNameAndPath() async throws {
         let engine = SearchEngine()
         let workspaces = [

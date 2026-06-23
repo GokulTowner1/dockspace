@@ -55,9 +55,6 @@ final class AppState: ObservableObject {
     private var lastDiscoveryTime: Date = .distantPast
     private let discoveryMinInterval: TimeInterval = 120   // 2 minutes
 
-    /// Debounced search pipeline — reliable on MainActor, avoids didSet races.
-    private static let searchDebounce: RunLoop.SchedulerTimeType.Stride = .milliseconds(120)
-
     // MARK: - Displayed List (single source of truth for UI + keyboard nav)
 
     /// Workspaces after search *and* the active filter tab — used by the palette and arrow keys.
@@ -96,15 +93,13 @@ final class AppState: ObservableObject {
         $searchText
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .removeDuplicates()
-            .handleEvents(receiveOutput: { [weak self] query in
-                self?.isSearching = !query.isEmpty
-                if !query.isEmpty, self?.activeFilter != .all {
-                    self?.activeFilter = .all
-                }
-            })
-            .debounce(for: Self.searchDebounce, scheduler: RunLoop.main)
             .sink { [weak self] query in
-                self?.applySearch(query: query)
+                guard let self else { return }
+                self.isSearching = !query.isEmpty
+                if !query.isEmpty, self.activeFilter != .all {
+                    self.activeFilter = .all
+                }
+                self.applySearch(query: query)
             }
             .store(in: &cancellables)
     }
@@ -170,6 +165,22 @@ final class AppState: ObservableObject {
     func forceRefresh() async {
         lastDiscoveryTime = .distantPast
         await discoverWorkspaces()
+    }
+
+    /// Wipes all persisted Dockspace data and rediscovers workspaces from scratch.
+    func resetAllApplicationData() async {
+        cacheEngine.clearAllData()
+        automationStore.clearAll()
+
+        workspaces = []
+        filteredWorkspaces = []
+        automationsByWorkspacePath = [:]
+        automationStepCounts = [:]
+        automationsLoaded = false
+        lastDiscoveryTime = .distantPast
+
+        resetSearch()
+        await forceRefresh()
     }
 
     // MARK: - Search
